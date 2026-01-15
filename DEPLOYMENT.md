@@ -144,13 +144,29 @@ Secrets loaded from Secret Manager:
 
 ## Datastore Setup (Cloud Run)
 
-The bot uses Google Cloud Datastore for persistent state. This happens automatically in Cloud Run - no manual setup required.
+The bot uses Google Cloud Datastore for persistent state. You must create these databases before deploying:
+
+```bash
+# Create required Datastore databases
+for db in discordian-threads discordian-dms discordian-reports discordian-pending; do
+  gcloud firestore databases create --database=$db --location=nam5 --type=datastore-mode
+done
+```
+
+**Databases:**
+| Database | Purpose | TTL |
+|----------|---------|-----|
+| `discordian-threads` | PR to Discord thread/message mapping | 30 days |
+| `discordian-dms` | DM message tracking | 7 days |
+| `discordian-reports` | Daily report tracking | 36 hours |
+| `discordian-pending` | Pending DM queue | 4 hours |
+
+Event deduplication uses in-memory storage only (2 hour TTL, not critical to persist).
 
 **Optional: Enable TTL for automatic cleanup**
 
 ```bash
-# Enable TTL on cache entries (recommended)
-for db in discordian-threads discordian-dms discordian-events discordian-reports discordian-pending; do
+for db in discordian-threads discordian-dms discordian-reports discordian-pending; do
   gcloud firestore fields ttls update expiry \
     --collection-group=CacheEntry \
     --enable-ttl \
@@ -188,7 +204,6 @@ The bot:
 - Thread/message IDs (so updates go to existing messages)
 - Pending DM queue (delayed notifications survive restarts)
 - Daily report tracking (prevents duplicate reports)
-- Event deduplication (prevents duplicate processing)
 
 ## Dependencies
 

@@ -27,20 +27,30 @@ type pendingDMQueue struct {
 }
 
 // FidoStore implements Store using fido with CloudRun backend.
-// Uses memory + Datastore for persistence across restarts.
+//
+// Requires these Datastore databases (must be created before use):
+//   - discordian-threads: PR to Discord thread/message mapping
+//   - discordian-dms: DM message tracking
+//   - discordian-reports: Daily report tracking
+//   - discordian-pending: Pending DM queue
+//
+// Event deduplication is in-memory only (2h TTL, not worth persisting).
 type FidoStore struct {
 	threads      *fido.TieredCache[string, ThreadInfo]
 	dmInfo       *fido.TieredCache[string, DMInfo]
-	events       *fido.TieredCache[string, bool]
 	dailyReports *fido.TieredCache[string, DailyReportInfo]
 	pendingDMs   *fido.TieredCache[string, pendingDMQueue]
-	pendingMu    sync.Mutex // Serializes pending DM operations
+
+	// Event dedup is in-memory only - short TTL, not critical to persist
+	events   map[string]time.Time
+	eventsMu sync.RWMutex
+
+	pendingMu sync.Mutex // Serializes pending DM operations
 }
 
 // NewFidoStore creates a new fido-backed store.
 // Uses CloudRun backend which auto-detects environment.
 func NewFidoStore(ctx context.Context) (*FidoStore, error) {
-	// Create stores for each data type
 	threadStore, err := cloudrun.New[string, ThreadInfo](ctx, "discordian-threads")
 	if err != nil {
 		return nil, fmt.Errorf("create thread store: %w", err)
@@ -49,11 +59,6 @@ func NewFidoStore(ctx context.Context) (*FidoStore, error) {
 	dmStore, err := cloudrun.New[string, DMInfo](ctx, "discordian-dms")
 	if err != nil {
 		return nil, fmt.Errorf("create dm store: %w", err)
-	}
-
-	eventStore, err := cloudrun.New[string, bool](ctx, "discordian-events")
-	if err != nil {
-		return nil, fmt.Errorf("create event store: %w", err)
 	}
 
 	reportStore, err := cloudrun.New[string, DailyReportInfo](ctx, "discordian-reports")
@@ -66,7 +71,6 @@ func NewFidoStore(ctx context.Context) (*FidoStore, error) {
 		return nil, fmt.Errorf("create pending store: %w", err)
 	}
 
-	// Create tiered caches
 	threads, err := fido.NewTiered(threadStore, fido.TTL(threadTTL))
 	if err != nil {
 		return nil, fmt.Errorf("create thread cache: %w", err)
@@ -75,11 +79,6 @@ func NewFidoStore(ctx context.Context) (*FidoStore, error) {
 	dmInfo, err := fido.NewTiered(dmStore, fido.TTL(dmInfoTTL))
 	if err != nil {
 		return nil, fmt.Errorf("create dm cache: %w", err)
-	}
-
-	events, err := fido.NewTiered(eventStore, fido.TTL(eventTTL))
-	if err != nil {
-		return nil, fmt.Errorf("create event cache: %w", err)
 	}
 
 	dailyReports, err := fido.NewTiered(reportStore, fido.TTL(dailyReportTTL))
@@ -92,16 +91,14 @@ func NewFidoStore(ctx context.Context) (*FidoStore, error) {
 		return nil, fmt.Errorf("create pending cache: %w", err)
 	}
 
-	store := &FidoStore{
+	slog.Info("initialized fido store with CloudRun backend")
+	return &FidoStore{
 		threads:      threads,
 		dmInfo:       dmInfo,
-		events:       events,
 		dailyReports: dailyReports,
 		pendingDMs:   pendingDMs,
-	}
-
-	slog.Info("initialized fido store with CloudRun backend")
-	return store, nil
+		events:       make(map[string]time.Time),
+	}, nil
 }
 
 // Thread retrieves thread info for a PR.
@@ -140,18 +137,23 @@ func (s *FidoStore) SaveDMInfo(ctx context.Context, userID, prURL string, info D
 }
 
 // WasProcessed checks if an event was already processed.
-func (s *FidoStore) WasProcessed(ctx context.Context, eventKey string) bool {
-	_, found, err := s.events.Get(ctx, eventKey)
-	if err != nil {
-		slog.Debug("event lookup error", "key", eventKey, "error", err)
+func (s *FidoStore) WasProcessed(_ context.Context, eventKey string) bool {
+	s.eventsMu.RLock()
+	expiry, found := s.events[eventKey]
+	s.eventsMu.RUnlock()
+
+	if !found {
 		return false
 	}
-	return found
+	return time.Now().Before(expiry)
 }
 
 // MarkProcessed marks an event as processed.
-func (s *FidoStore) MarkProcessed(ctx context.Context, eventKey string, ttl time.Duration) error {
-	return s.events.SetTTL(ctx, eventKey, true, ttl)
+func (s *FidoStore) MarkProcessed(_ context.Context, eventKey string, ttl time.Duration) error {
+	s.eventsMu.Lock()
+	s.events[eventKey] = time.Now().Add(ttl)
+	s.eventsMu.Unlock()
+	return nil
 }
 
 // DailyReportInfo retrieves daily report info for a user.
@@ -238,6 +240,16 @@ func (s *FidoStore) RemovePendingDM(ctx context.Context, id string) error {
 
 // Cleanup removes expired entries.
 func (s *FidoStore) Cleanup(ctx context.Context) error {
+	// Clean up expired events from memory
+	s.eventsMu.Lock()
+	now := time.Now()
+	for key, expiry := range s.events {
+		if now.After(expiry) {
+			delete(s.events, key)
+		}
+	}
+	s.eventsMu.Unlock()
+
 	// Clean up stale pending DMs
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -251,11 +263,9 @@ func (s *FidoStore) Cleanup(ctx context.Context) error {
 		return nil
 	}
 
-	now := time.Now()
 	modified := false
 	for id := range queue.DMs {
 		dm := queue.DMs[id]
-		// Remove entries that are way past their send time
 		if now.Sub(dm.SendAt) > pendingDMTTL {
 			delete(queue.DMs, id)
 			modified = true
@@ -277,9 +287,6 @@ func (s *FidoStore) Close() error {
 	}
 	if err := s.dmInfo.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close dmInfo: %w", err))
-	}
-	if err := s.events.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("close events: %w", err))
 	}
 	if err := s.dailyReports.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close dailyReports: %w", err))
