@@ -1,0 +1,380 @@
+// Package config manages server and repository configurations.
+package config
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/go-github/v50/github"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	defaultReminderDMDelayMinutes = 65
+	defaultConfigCacheTTL         = 20 * time.Minute
+	maxRetryAttempts              = 5
+	retryDelay                    = time.Second
+	maxRetryDelay                 = 2 * time.Minute
+)
+
+// ServerConfig holds server configuration from environment variables.
+type ServerConfig struct {
+	GitHubAppID           string
+	GitHubPrivateKey      string
+	SprinklerURL          string
+	TurnURL               string
+	DiscordBotToken       string
+	GCPProject            string
+	Port                  string
+	AllowPersonalAccounts bool
+}
+
+// DiscordConfig represents the discord.yaml configuration for a GitHub org.
+type DiscordConfig struct {
+	Channels map[string]ChannelConfig `yaml:"channels"`
+	Users    map[string]string        `yaml:"users"` // GitHub username -> Discord ID
+	Global   GlobalConfig             `yaml:"global"`
+}
+
+// GlobalConfig holds global settings for the org.
+type GlobalConfig struct {
+	GuildID         string `yaml:"guild_id"`
+	ReminderDMDelay int    `yaml:"reminder_dm_delay"`
+}
+
+// ChannelConfig holds per-channel settings.
+type ChannelConfig struct {
+	Repos           []string `yaml:"repos"`
+	ReminderDMDelay *int     `yaml:"reminder_dm_delay"`
+	Type            string   `yaml:"type"` // "forum" or "text"
+	Mute            bool     `yaml:"mute"`
+}
+
+type configCacheEntry struct {
+	config    *DiscordConfig
+	timestamp time.Time
+}
+
+type configCache struct {
+	entries map[string]configCacheEntry
+	ttl     time.Duration
+	mu      sync.RWMutex
+	hits    atomic.Int64
+	misses  atomic.Int64
+}
+
+func (c *configCache) get(org string) (*DiscordConfig, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.entries[org]
+	if !exists {
+		c.misses.Add(1)
+		return nil, false
+	}
+
+	if time.Since(entry.timestamp) > c.ttl {
+		c.misses.Add(1)
+		return nil, false
+	}
+
+	c.hits.Add(1)
+	return entry.config, true
+}
+
+func (c *configCache) set(org string, cfg *DiscordConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries[org] = configCacheEntry{
+		config:    cfg,
+		timestamp: time.Now(),
+	}
+}
+
+func (c *configCache) invalidate(org string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.entries, org)
+	slog.Info("invalidated config cache", "org", org)
+}
+
+func (c *configCache) stats() (hits, misses int64) {
+	return c.hits.Load(), c.misses.Load()
+}
+
+// Manager manages repository configurations.
+type Manager struct {
+	configs map[string]*DiscordConfig
+	clients map[string]any
+	cache   *configCache
+	mu      sync.RWMutex
+}
+
+// New creates a new config manager.
+func New() *Manager {
+	return &Manager{
+		configs: make(map[string]*DiscordConfig),
+		clients: make(map[string]any),
+		cache: &configCache{
+			entries: make(map[string]configCacheEntry),
+			ttl:     defaultConfigCacheTTL,
+		},
+	}
+}
+
+// SetGitHubClient sets the GitHub client for a specific org.
+func (m *Manager) SetGitHubClient(org string, client any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clients[org] = client
+}
+
+func createDefaultConfig() *DiscordConfig {
+	return &DiscordConfig{
+		Global: GlobalConfig{
+			ReminderDMDelay: defaultReminderDMDelayMinutes,
+		},
+		Channels: make(map[string]ChannelConfig),
+		Users:    make(map[string]string),
+	}
+}
+
+// LoadConfig loads discord.yaml configuration for a GitHub org with retry logic.
+func (m *Manager) LoadConfig(ctx context.Context, org string) error {
+	if cfg, found := m.cache.get(org); found {
+		hits, misses := m.cache.stats()
+		slog.Debug("using cached config",
+			"org", org,
+			"cache_hits", hits,
+			"cache_misses", misses)
+
+		m.mu.Lock()
+		m.configs[org] = cfg
+		m.mu.Unlock()
+		return nil
+	}
+
+	slog.Info("loading config", "org", org, "config_file", ".codeGROOVE/discord.yaml")
+
+	m.mu.Lock()
+	clientAny := m.clients[org]
+	m.mu.Unlock()
+
+	if clientAny == nil {
+		return fmt.Errorf("github client not initialized for org: %s", org)
+	}
+
+	client, ok := clientAny.(*github.Client)
+	if !ok {
+		return fmt.Errorf("invalid github client type for org: %s", org)
+	}
+
+	cfg, err := m.fetchConfig(ctx, client, org)
+	if err != nil {
+		slog.Warn("using default config", "org", org, "reason", err)
+		cfg = createDefaultConfig()
+	}
+
+	m.mu.Lock()
+	m.configs[org] = cfg
+	m.mu.Unlock()
+
+	m.cache.set(org, cfg)
+
+	slog.Info("config loaded",
+		"org", org,
+		"channels", len(cfg.Channels),
+		"users", len(cfg.Users),
+		"guild_id", cfg.Global.GuildID)
+
+	return nil
+}
+
+func (*Manager) fetchConfig(ctx context.Context, client *github.Client, org string) (*DiscordConfig, error) {
+	var content *github.RepositoryContent
+	var err error
+
+	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
+		content, _, _, err = client.Repositories.GetContents(ctx, org, ".codeGROOVE", "discord.yaml", nil)
+		if err == nil {
+			break
+		}
+
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusNotFound {
+			return nil, errors.New("config not found")
+		}
+
+		if attempt < maxRetryAttempts {
+			delay := retryDelay * time.Duration(1<<(attempt-1))
+			if delay > maxRetryDelay {
+				delay = maxRetryDelay
+			}
+			time.Sleep(delay)
+		}
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch config: %w", err)
+	}
+
+	if content == nil || content.Content == nil {
+		return nil, errors.New("config file empty")
+	}
+
+	configContent, err := content.GetContent()
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode config: %w", err)
+	}
+
+	var cfg DiscordConfig
+	if err := yaml.Unmarshal([]byte(configContent), &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// Config returns the configuration for a GitHub org.
+func (m *Manager) Config(org string) (*DiscordConfig, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cfg, exists := m.configs[org]
+	return cfg, exists
+}
+
+// ChannelsForRepo returns the Discord channels configured for a specific repo.
+func (m *Manager) ChannelsForRepo(org, repo string) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cfg, exists := m.configs[org]
+	if !exists {
+		return []string{strings.ToLower(repo)}
+	}
+
+	var channels []string
+	var explicitlyConfigured bool
+
+	for channelName, channelCfg := range cfg.Channels {
+		normalizedName := strings.ToLower(channelName)
+
+		for _, configRepo := range channelCfg.Repos {
+			if configRepo == "*" || configRepo == repo {
+				explicitlyConfigured = true
+				if channelCfg.Mute {
+					continue
+				}
+				channels = append(channels, normalizedName)
+				break
+			}
+		}
+	}
+
+	// Auto-discover: add repo-named channel unless already included or muted
+	autoChannel := strings.ToLower(repo)
+	for _, existing := range channels {
+		if existing == autoChannel {
+			goto done // Already included
+		}
+	}
+
+	// Check if auto-discovered channel is muted
+	for yamlChannelName, channelCfg := range cfg.Channels {
+		if strings.EqualFold(yamlChannelName, autoChannel) && channelCfg.Mute {
+			goto done
+		}
+	}
+	channels = append(channels, autoChannel)
+
+done:
+	if len(channels) > 0 {
+		slog.Debug("resolved channels",
+			"org", org,
+			"repo", repo,
+			"channels", channels,
+			"explicit", explicitlyConfigured)
+	}
+
+	return channels
+}
+
+// ChannelType returns the channel type ("forum" or "text").
+func (m *Manager) ChannelType(org, channel string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cfg, exists := m.configs[org]
+	if !exists {
+		return "text"
+	}
+
+	if ch, ok := cfg.Channels[channel]; ok && ch.Type == "forum" {
+		return "forum"
+	}
+	return "text"
+}
+
+// DiscordUserID returns the mapped Discord ID for a GitHub username.
+func (m *Manager) DiscordUserID(org, githubUsername string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cfg, exists := m.configs[org]
+	if !exists {
+		return ""
+	}
+	return cfg.Users[githubUsername]
+}
+
+// ReminderDMDelay returns the DM delay in minutes for a channel.
+func (m *Manager) ReminderDMDelay(org, channel string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cfg, exists := m.configs[org]
+	if !exists {
+		return defaultReminderDMDelayMinutes
+	}
+
+	if channelCfg, ok := cfg.Channels[channel]; ok && channelCfg.ReminderDMDelay != nil {
+		return *channelCfg.ReminderDMDelay
+	}
+
+	if cfg.Global.ReminderDMDelay > 0 {
+		return cfg.Global.ReminderDMDelay
+	}
+	return defaultReminderDMDelayMinutes
+}
+
+// GuildID returns the guild ID for an organization.
+func (m *Manager) GuildID(org string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cfg, exists := m.configs[org]
+	if !exists {
+		return ""
+	}
+	return cfg.Global.GuildID
+}
+
+// ReloadConfig reloads the configuration for an org.
+func (m *Manager) ReloadConfig(ctx context.Context, org string) error {
+	m.cache.invalidate(org)
+	return m.LoadConfig(ctx, org)
+}
+
+// CacheStats returns cache statistics.
+func (m *Manager) CacheStats() (hits, misses int64) {
+	return m.cache.stats()
+}
