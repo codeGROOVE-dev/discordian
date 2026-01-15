@@ -92,6 +92,15 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 		return fmt.Errorf("invalid PR URL: %s", event.URL)
 	}
 
+	// Auto-reload config when .codeGROOVE repo is updated
+	if repo == ".codeGROOVE" {
+		c.logger.Info("config repo updated, reloading config", "org", c.org)
+		if err := c.config.ReloadConfig(ctx, c.org); err != nil {
+			c.logger.Warn("failed to reload config", "error", err)
+		}
+		return nil // Don't post notifications for config repo PRs
+	}
+
 	// Deduplicate
 	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
 	if c.store.WasProcessed(ctx, eventKey) {
@@ -133,7 +142,10 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	// Get channels for this repo
 	channels := c.config.ChannelsForRepo(c.org, repo)
 	if len(channels) == 0 {
-		c.logger.Debug("no channels configured for repo", "repo", repo)
+		c.logger.Warn("no channels found for repo - check that a channel named the same as the repo exists in Discord",
+			"repo", repo,
+			"org", c.org)
+		return nil
 	}
 
 	// Process each channel

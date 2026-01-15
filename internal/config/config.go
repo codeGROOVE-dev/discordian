@@ -18,7 +18,7 @@ import (
 
 const (
 	defaultReminderDMDelayMinutes = 65
-	defaultConfigCacheTTL         = 20 * time.Minute
+	defaultConfigCacheTTL         = 10 * time.Minute
 	maxRetryAttempts              = 5
 	retryDelay                    = time.Second
 	maxRetryDelay                 = 2 * time.Minute
@@ -195,6 +195,22 @@ func (m *Manager) LoadConfig(ctx context.Context, org string) error {
 		"channels", len(cfg.Channels),
 		"users", len(cfg.Users),
 		"guild_id", cfg.Global.GuildID)
+
+	// Log detailed config at debug level
+	for channelName, channelCfg := range cfg.Channels {
+		slog.Debug("config channel",
+			"org", org,
+			"channel", channelName,
+			"repos", channelCfg.Repos,
+			"type", channelCfg.Type,
+			"mute", channelCfg.Mute)
+	}
+	for ghUser, discordID := range cfg.Users {
+		slog.Debug("config user mapping",
+			"org", org,
+			"github_user", ghUser,
+			"discord_id", discordID)
+	}
 
 	return nil
 }
