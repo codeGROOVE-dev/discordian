@@ -38,6 +38,7 @@ type DiscordClient interface {
 // ConfigManager defines configuration operations.
 type ConfigManager interface {
 	LoadConfig(ctx context.Context, org string) error
+	ReloadConfig(ctx context.Context, org string) error
 	Config(org string) (*config.DiscordConfig, bool)
 	ChannelsForRepo(org, repo string) []string
 	ChannelType(org, channel string) string
