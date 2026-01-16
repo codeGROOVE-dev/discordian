@@ -565,6 +565,47 @@ func (c *Client) IsUserInGuild(ctx context.Context, userID string) bool {
 	return true
 }
 
+// IsUserActive checks if a user is currently online, idle, or do-not-disturb (not offline).
+func (c *Client) IsUserActive(ctx context.Context, userID string) bool {
+	c.mu.RLock()
+	guildID := c.guildID
+	c.mu.RUnlock()
+
+	if guildID == "" {
+		slog.Debug("cannot check user presence - no guild ID set",
+			"user_id", userID)
+		return false
+	}
+
+	// Get presence for the user in the guild
+	presences, err := c.session.State.Presences(guildID)
+	if err != nil {
+		slog.Debug("failed to get presences",
+			"guild_id", guildID,
+			"error", err)
+		return false
+	}
+
+	// Find user's presence
+	for _, p := range presences {
+		if p.User.ID == userID {
+			// Consider "online", "idle", and "dnd" as active
+			// "offline" or "" means not active
+			isActive := p.Status == "online" || p.Status == "idle" || p.Status == "dnd"
+			slog.Debug("user presence check",
+				"user_id", userID,
+				"status", p.Status,
+				"is_active", isActive)
+			return isActive
+		}
+	}
+
+	// User presence not found - assume offline
+	slog.Debug("user presence not found - assuming offline",
+		"user_id", userID)
+	return false
+}
+
 // GuildInfo holds basic guild information.
 type GuildInfo struct {
 	ID   string
