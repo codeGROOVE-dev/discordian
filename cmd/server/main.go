@@ -172,6 +172,16 @@ func run(ctx context.Context, cancel context.CancelFunc) int {
 	return 0
 }
 
+// configAdapter adapts config.Manager to usermapping.ReverseConfigLookup.
+type configAdapter struct {
+	mgr *config.Manager
+}
+
+func (ca *configAdapter) Config(org string) (usermapping.OrgConfig, bool) {
+	cfg, ok := ca.mgr.Config(org)
+	return cfg, ok
+}
+
 // coordinatorManager manages bot coordinators for multiple GitHub orgs.
 type coordinatorManager struct {
 	cfg            config.ServerConfig
@@ -180,6 +190,7 @@ type coordinatorManager struct {
 	guildManager   *discord.GuildManager
 	store          state.Store
 	notifyMgr      *notify.Manager
+	reverseMapper  *usermapping.ReverseMapper              // Discord ID -> GitHub username
 	active         map[string]context.CancelFunc           // org -> cancel func
 	failed         map[string]time.Time                    // org -> last failure time
 	discordClients map[string]*discord.Client              // guildID -> client
@@ -206,6 +217,7 @@ func runCoordinators(
 		guildManager:   guildManager,
 		store:          store,
 		notifyMgr:      notifyMgr,
+		reverseMapper:  usermapping.NewReverseMapper(),
 		active:         make(map[string]context.CancelFunc),
 		failed:         make(map[string]time.Time),
 		discordClients: make(map[string]*discord.Client),
@@ -598,47 +610,21 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		"orgs", orgsForGuild,
 		"org_count", len(orgsForGuild))
 
-	// Get the Discord client for username lookup
-	discordClient, exists := cm.discordClients[guildID]
-	if !exists {
-		return nil, fmt.Errorf("no Discord client found for guild %s", guildID)
-	}
-
-	// Try to determine GitHub username from Discord user ID
-	// Check all org configs for user mappings
-	var githubUsername string
-	for _, org := range orgsForGuild {
-		cfg, exists := cm.configManager.Config(org)
-		if !exists {
-			continue
-		}
-		for ghUser, discordID := range cfg.Users {
-			if discordID == userID {
-				githubUsername = ghUser
-				break
-			}
-		}
-		if githubUsername != "" {
-			break
-		}
-	}
-
+	// Use reverse mapper to find GitHub username from Discord user ID
+	githubUsername := cm.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{cm.configManager}, orgsForGuild)
 	if githubUsername == "" {
-		// Try username-based lookup (Discord username == GitHub username)
-		members, err := discordClient.Session().GuildMembers(guildID, "", 1000)
-		if err == nil {
-			for _, member := range members {
-				if member.User.ID == userID {
-					githubUsername = member.User.Username
-					break
-				}
-			}
-		}
+		slog.Warn("no GitHub username mapping found for Discord user - add to config.yaml users section",
+			"guild_id", guildID,
+			"user_id", userID,
+			"orgs_checked", orgsForGuild)
+		return nil, errors.New("no GitHub username mapping found for Discord user")
 	}
 
-	if githubUsername == "" {
-		return nil, errors.New("could not map Discord user to GitHub username")
-	}
+	slog.Info("mapped Discord user to GitHub username",
+		"guild_id", guildID,
+		"user_id", userID,
+		"github_username", githubUsername,
+		"orgs", orgsForGuild)
 
 	// Aggregate PRs from all orgs for this guild
 	var incomingPRs []discord.PRSummary
@@ -648,87 +634,147 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 
 	for _, org := range orgsForGuild {
 		// Get GitHub client for this org
-		ghClient, exists := cm.githubManager.ClientForOrg(org)
+		client, exists := cm.githubManager.ClientForOrg(org)
 		if !exists {
 			slog.Warn("no GitHub client for org, skipping", "org", org)
 			continue
 		}
 
-		// Search open PRs in this org
-		openPRs, err := searcher.ListOpenPRs(ctx, org, 24)
+		// Create Turn client for this org
+		turn := bot.NewTurnClient(cm.cfg.TurnURL, client)
+
+		// Search for PRs authored by this user (outgoing)
+		authored, err := searcher.ListAuthoredPRs(ctx, org, githubUsername)
 		if err != nil {
-			slog.Warn("failed to list PRs for org", "org", org, "error", err)
-			continue
+			slog.Warn("failed to search authored PRs", "org", org, "error", err)
+		} else {
+			slog.Info("found authored PRs",
+				"github_username", githubUsername,
+				"org", org,
+				"count", len(authored))
+
+			for _, pr := range authored {
+				summary := analyzePRForReport(ctx, pr, githubUsername, turn)
+				if summary != nil {
+					outgoingPRs = append(outgoingPRs, *summary)
+				}
+			}
 		}
 
-		// Create Turn client for this org
-		turnClient := bot.NewTurnClient(cm.cfg.TurnURL, ghClient)
+		// Search for PRs where user is requested to review (incoming)
+		review, err := searcher.ListReviewRequestedPRs(ctx, org, githubUsername)
+		if err != nil {
+			slog.Warn("failed to search review-requested PRs", "org", org, "error", err)
+		} else {
+			slog.Info("found review-requested PRs",
+				"github_username", githubUsername,
+				"org", org,
+				"count", len(review))
 
-		// Analyze each PR for this user
-		for _, pr := range openPRs {
-			prInfo, ok := bot.ParsePRURL(pr.URL)
-			if !ok {
-				continue
-			}
-
-			// Call Turn API to analyze this PR for this user
-			checkResp, err := turnClient.Check(ctx, pr.URL, githubUsername, pr.UpdatedAt)
-			if err != nil {
-				continue
-			}
-
-			// Determine PR state
-			prState := format.StateFromAnalysis(format.StateAnalysisParams{
-				Merged:             checkResp.PullRequest.Merged,
-				Closed:             checkResp.PullRequest.Closed,
-				Draft:              checkResp.PullRequest.Draft,
-				MergeConflict:      checkResp.Analysis.MergeConflict,
-				Approved:           checkResp.Analysis.Approved,
-				ChecksFailing:      checkResp.Analysis.Checks.Failing,
-				ChecksPending:      checkResp.Analysis.Checks.Pending,
-				ChecksWaiting:      checkResp.Analysis.Checks.Waiting,
-				UnresolvedComments: checkResp.Analysis.UnresolvedComments,
-				WorkflowState:      checkResp.Analysis.WorkflowState,
-			})
-
-			// Determine if PR is blocked
-			isBlocked := prState == format.StateTestsBroken ||
-				prState == format.StateChanges ||
-				prState == format.StateConflict
-
-			// Check if user has an action on this PR
-			action, hasAction := checkResp.Analysis.NextAction[githubUsername]
-			isAuthor := checkResp.PullRequest.Author == githubUsername
-
-			summary := discord.PRSummary{
-				Repo:      prInfo.Repo,
-				Number:    prInfo.Number,
-				Title:     checkResp.PullRequest.Title,
-				Author:    checkResp.PullRequest.Author,
-				State:     string(prState),
-				URL:       pr.URL,
-				UpdatedAt: pr.UpdatedAt.Format(time.RFC3339),
-				IsBlocked: isBlocked,
-			}
-
-			if hasAction {
-				summary.Action = format.ActionLabel(action.Kind)
-			}
-
-			// Categorize as incoming or outgoing
-			if isAuthor {
-				outgoingPRs = append(outgoingPRs, summary)
-			} else if hasAction {
-				incomingPRs = append(incomingPRs, summary)
+			for _, pr := range review {
+				summary := analyzePRForReport(ctx, pr, githubUsername, turn)
+				if summary != nil {
+					incomingPRs = append(incomingPRs, *summary)
+				}
 			}
 		}
 	}
+
+	slog.Info("report generation complete",
+		"github_username", githubUsername,
+		"guild_id", guildID,
+		"user_id", userID,
+		"incoming_prs", len(incomingPRs),
+		"outgoing_prs", len(outgoingPRs))
 
 	return &discord.PRReport{
 		IncomingPRs: incomingPRs,
 		OutgoingPRs: outgoingPRs,
 		GeneratedAt: time.Now().Format(time.RFC3339),
 	}, nil
+}
+
+// analyzePRForReport analyzes a single PR and returns a summary if relevant.
+func analyzePRForReport(
+	ctx context.Context,
+	pr bot.PRSearchResult,
+	githubUsername string,
+	turn bot.TurnClient,
+) *discord.PRSummary {
+	info, ok := bot.ParsePRURL(pr.URL)
+	if !ok {
+		slog.Warn("failed to parse PR URL",
+			"pr_url", pr.URL,
+			"github_username", githubUsername)
+		return nil
+	}
+
+	slog.Info("analyzing PR for user report",
+		"pr_url", pr.URL,
+		"github_username", githubUsername,
+		"updated_at", pr.UpdatedAt.Format(time.RFC3339))
+
+	// Call Turn API to analyze this PR for this user
+	resp, err := turn.Check(ctx, pr.URL, githubUsername, pr.UpdatedAt)
+	if err != nil {
+		slog.Warn("Turn API failed for PR in report generation",
+			"pr_url", pr.URL,
+			"github_username", githubUsername,
+			"error", err)
+		return nil
+	}
+
+	slog.Info("Turn API response for PR",
+		"pr_url", pr.URL,
+		"github_username", githubUsername,
+		"pr_author", resp.PullRequest.Author,
+		"pr_title", resp.PullRequest.Title,
+		"workflow_state", resp.Analysis.WorkflowState,
+		"next_action_count", len(resp.Analysis.NextAction))
+
+	// Determine PR state
+	st := format.StateFromAnalysis(format.StateAnalysisParams{
+		Merged:             resp.PullRequest.Merged,
+		Closed:             resp.PullRequest.Closed,
+		Draft:              resp.PullRequest.Draft,
+		MergeConflict:      resp.Analysis.MergeConflict,
+		Approved:           resp.Analysis.Approved,
+		ChecksFailing:      resp.Analysis.Checks.Failing,
+		ChecksPending:      resp.Analysis.Checks.Pending,
+		ChecksWaiting:      resp.Analysis.Checks.Waiting,
+		UnresolvedComments: resp.Analysis.UnresolvedComments,
+		WorkflowState:      resp.Analysis.WorkflowState,
+	})
+
+	// Determine if PR is blocked
+	blocked := st == format.StateTestsBroken ||
+		st == format.StateChanges ||
+		st == format.StateConflict
+
+	// Check if user has an action on this PR
+	action, hasAction := resp.Analysis.NextAction[githubUsername]
+
+	summary := discord.PRSummary{
+		Repo:      info.Repo,
+		Number:    info.Number,
+		Title:     resp.PullRequest.Title,
+		Author:    resp.PullRequest.Author,
+		State:     string(st),
+		URL:       pr.URL,
+		UpdatedAt: pr.UpdatedAt.Format(time.RFC3339),
+		IsBlocked: blocked,
+	}
+
+	if hasAction {
+		summary.Action = format.ActionLabel(action.Kind)
+		slog.Info("user has action on PR",
+			"pr_url", pr.URL,
+			"github_username", githubUsername,
+			"action_kind", action.Kind,
+			"is_author", resp.PullRequest.Author == githubUsername)
+	}
+
+	return &summary
 }
 
 func loadConfig(ctx context.Context) (config.ServerConfig, error) {
