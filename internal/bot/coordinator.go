@@ -150,10 +150,15 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 		return nil // Don't post notifications for config repo PRs
 	}
 
-	// Deduplicate by delivery ID
+	// Atomically claim event to prevent duplicate processing across instances
 	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
-	if c.store.WasProcessed(ctx, eventKey) {
-		c.logger.Debug("skipping duplicate event", "delivery_id", event.DeliveryID)
+	claimed, err := c.store.ClaimEvent(ctx, eventKey, eventDeduplicationTTL)
+	if err != nil {
+		c.logger.Warn("failed to claim event", "error", err, "delivery_id", event.DeliveryID)
+		return fmt.Errorf("claim event: %w", err)
+	}
+	if !claimed {
+		c.logger.Debug("event already claimed by another instance", "delivery_id", event.DeliveryID)
 		return nil
 	}
 
@@ -218,11 +223,7 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	// Queue DM notifications
 	c.queueDMNotifications(ctx, owner, repo, number, checkResp, prState)
 
-	// Mark as processed
-	if err := c.store.MarkProcessed(ctx, eventKey, eventDeduplicationTTL); err != nil {
-		c.logger.Warn("failed to mark event processed", "error", err)
-	}
-
+	// Event was already marked as processed when claimed at the start
 	return nil
 }
 
@@ -954,10 +955,14 @@ func (c *Coordinator) reconcilePR(ctx context.Context, pr PRSearchResult) {
 		DeliveryID: fmt.Sprintf("poll-%s-%d", pr.URL, time.Now().UnixNano()),
 	}
 
-	// Use a unique event key for polling to avoid dedup conflicts with real events
-	// but still prevent duplicate poll processing
+	// Atomically claim poll event to prevent duplicate processing
 	pollKey := fmt.Sprintf("poll:%s:%s", pr.URL, pr.UpdatedAt.Format(time.RFC3339))
-	if c.store.WasProcessed(ctx, pollKey) {
+	claimed, err := c.store.ClaimEvent(ctx, pollKey, eventDeduplicationTTL)
+	if err != nil {
+		c.logger.Warn("failed to claim poll event", "error", err, "pr_url", pr.URL)
+		return
+	}
+	if !claimed {
 		return // Already processed this PR at this update time
 	}
 
@@ -969,10 +974,7 @@ func (c *Coordinator) reconcilePR(ctx context.Context, pr PRSearchResult) {
 		return
 	}
 
-	// Mark as processed
-	if err := c.store.MarkProcessed(ctx, pollKey, eventDeduplicationTTL); err != nil {
-		c.logger.Warn("failed to mark poll processed", "error", err)
-	}
+	// Event was already marked as processed when claimed
 }
 
 // checkDailyReports checks if daily reports should be sent to users.

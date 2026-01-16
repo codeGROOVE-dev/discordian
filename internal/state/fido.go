@@ -18,10 +18,6 @@ const (
 	eventTTL       = 2 * time.Hour       // Short - just for dedup
 	dailyReportTTL = 36 * time.Hour      // Slightly over 1 day to handle timezone edge cases
 	pendingDMTTL   = 4 * time.Hour       // Max time a DM can be pending
-
-	// maxEventMapSize is the maximum number of entries before inline cleanup.
-	// This prevents unbounded memory growth between scheduled cleanups.
-	maxEventMapSize = 10000
 )
 
 // pendingDMQueue stores all pending DMs in a single persisted value.
@@ -37,17 +33,13 @@ type pendingDMQueue struct {
 //   - discordian-dms: DM message tracking
 //   - discordian-reports: Daily report tracking
 //   - discordian-pending: Pending DM queue
-//
-// Event deduplication is in-memory only (2h TTL, not worth persisting).
+//   - discordian-events: Event deduplication (persisted for cross-instance safety)
 type FidoStore struct {
 	threads      *fido.TieredCache[string, ThreadInfo]
 	dmInfo       *fido.TieredCache[string, DMInfo]
 	dailyReports *fido.TieredCache[string, DailyReportInfo]
 	pendingDMs   *fido.TieredCache[string, pendingDMQueue]
-
-	// Event dedup is in-memory only - short TTL, not critical to persist
-	events   map[string]time.Time
-	eventsMu sync.RWMutex
+	events       *fido.TieredCache[string, time.Time] // Persisted for cross-instance dedup
 
 	// Reverse index: prURL -> userIDs who received DMs
 	// Populated when SaveDMInfo is called
@@ -65,6 +57,7 @@ type fidoStoreOptions struct {
 	dmStore      fido.Store[string, DMInfo]
 	reportStore  fido.Store[string, DailyReportInfo]
 	pendingStore fido.Store[string, pendingDMQueue]
+	eventStore   fido.Store[string, time.Time]
 }
 
 // WithThreadStore sets a custom store for thread data.
@@ -85,6 +78,11 @@ func WithReportStore(s fido.Store[string, DailyReportInfo]) FidoStoreOption {
 // WithPendingStore sets a custom store for pending DM data.
 func WithPendingStore(s fido.Store[string, pendingDMQueue]) FidoStoreOption {
 	return func(o *fidoStoreOptions) { o.pendingStore = s }
+}
+
+// WithEventStore sets a custom store for event deduplication data.
+func WithEventStore(s fido.Store[string, time.Time]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.eventStore = s }
 }
 
 // NewFidoStore creates a new fido-backed store.
@@ -133,6 +131,15 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		}
 	}
 
+	eventStore := o.eventStore
+	if eventStore == nil {
+		var err error
+		eventStore, err = cloudrun.New[string, time.Time](ctx, "discordian-events")
+		if err != nil {
+			return nil, fmt.Errorf("create event store: %w", err)
+		}
+	}
+
 	threads, err := fido.NewTiered(threadStore, fido.TTL(threadTTL))
 	if err != nil {
 		return nil, fmt.Errorf("create thread cache: %w", err)
@@ -153,13 +160,18 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		return nil, fmt.Errorf("create pending cache: %w", err)
 	}
 
+	events, err := fido.NewTiered(eventStore, fido.TTL(eventTTL))
+	if err != nil {
+		return nil, fmt.Errorf("create event cache: %w", err)
+	}
+
 	slog.Info("initialized fido store")
 	return &FidoStore{
 		threads:      threads,
 		dmInfo:       dmInfo,
 		dailyReports: dailyReports,
 		pendingDMs:   pendingDMs,
-		events:       make(map[string]time.Time),
+		events:       events,
 		dmUserIndex:  make(map[string]map[string]bool),
 	}, nil
 }
@@ -232,11 +244,12 @@ func (s *FidoStore) ListDMUsers(_ context.Context, prURL string) []string {
 }
 
 // WasProcessed checks if an event was already processed.
-func (s *FidoStore) WasProcessed(_ context.Context, eventKey string) bool {
-	s.eventsMu.RLock()
-	expiry, found := s.events[eventKey]
-	s.eventsMu.RUnlock()
-
+func (s *FidoStore) WasProcessed(ctx context.Context, eventKey string) bool {
+	expiry, found, err := s.events.Get(ctx, eventKey)
+	if err != nil {
+		slog.Debug("event lookup error", "key", eventKey, "error", err)
+		return false
+	}
 	if !found {
 		return false
 	}
@@ -244,25 +257,34 @@ func (s *FidoStore) WasProcessed(_ context.Context, eventKey string) bool {
 }
 
 // MarkProcessed marks an event as processed.
-func (s *FidoStore) MarkProcessed(_ context.Context, eventKey string, ttl time.Duration) error {
-	s.eventsMu.Lock()
-	defer s.eventsMu.Unlock()
+func (s *FidoStore) MarkProcessed(ctx context.Context, eventKey string, ttl time.Duration) error {
+	expiry := time.Now().Add(ttl)
+	return s.events.Set(ctx, eventKey, expiry)
+}
 
-	s.events[eventKey] = time.Now().Add(ttl)
-
-	// Inline cleanup if map grows too large to prevent memory exhaustion
-	if len(s.events) > maxEventMapSize {
-		now := time.Now()
-		for key, expiry := range s.events {
-			if now.After(expiry) {
-				delete(s.events, key)
-			}
-		}
-		slog.Debug("performed inline event map cleanup",
-			"remaining", len(s.events))
+// ClaimEvent atomically claims an event for processing.
+// Returns true if successfully claimed (first to claim), false if already claimed.
+// Uses persisted cache for cross-instance deduplication.
+func (s *FidoStore) ClaimEvent(ctx context.Context, eventKey string, ttl time.Duration) (bool, error) {
+	// Check if already claimed/processed
+	expiry, found, err := s.events.Get(ctx, eventKey)
+	if err != nil {
+		slog.Debug("event claim check error", "key", eventKey, "error", err)
+		return false, fmt.Errorf("check event: %w", err)
 	}
 
-	return nil
+	if found && time.Now().Before(expiry) {
+		// Already claimed and not expired
+		return false, nil
+	}
+
+	// Claim it by marking as processed
+	newExpiry := time.Now().Add(ttl)
+	if err := s.events.Set(ctx, eventKey, newExpiry); err != nil {
+		return false, fmt.Errorf("claim event: %w", err)
+	}
+
+	return true, nil
 }
 
 // DailyReportInfo retrieves daily report info for a user.
@@ -349,17 +371,8 @@ func (s *FidoStore) RemovePendingDM(ctx context.Context, id string) error {
 
 // Cleanup removes expired entries.
 func (s *FidoStore) Cleanup(ctx context.Context) error {
+	// Events are now managed by fido cache with automatic TTL cleanup
 	now := time.Now()
-
-	// Clean up expired events from memory
-	s.eventsMu.Lock()
-	for key, expiry := range s.events {
-		if now.After(expiry) {
-			delete(s.events, key)
-		}
-	}
-	eventCount := len(s.events)
-	s.eventsMu.Unlock()
 
 	// Clean up stale dmUserIndex entries
 	// Remove entries for PRs that haven't been updated recently
@@ -403,9 +416,7 @@ func (s *FidoStore) Cleanup(ctx context.Context) error {
 
 	queue, _, err := s.pendingDMs.Get(ctx, pendingQueueKey)
 	if err != nil {
-		slog.Debug("cleanup: pending DM fetch info",
-			"events_remaining", eventCount,
-			"error", err)
+		slog.Debug("cleanup: pending DM fetch error", "error", err)
 		return nil
 	}
 

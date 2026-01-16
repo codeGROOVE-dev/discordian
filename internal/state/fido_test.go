@@ -18,6 +18,7 @@ func newTestFidoStore(t *testing.T) *FidoStore {
 		WithDMStore(null.New[string, DMInfo]()),
 		WithReportStore(null.New[string, DailyReportInfo]()),
 		WithPendingStore(null.New[string, pendingDMQueue]()),
+		WithEventStore(null.New[string, time.Time]()),
 	)
 	if err != nil {
 		t.Fatalf("failed to create test fido store: %v", err)

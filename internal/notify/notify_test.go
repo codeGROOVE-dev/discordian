@@ -60,6 +60,10 @@ func (m *mockStore) MarkProcessed(_ context.Context, _ string, _ time.Duration) 
 	return nil
 }
 
+func (m *mockStore) ClaimEvent(_ context.Context, _ string, _ time.Duration) (bool, error) {
+	return true, nil
+}
+
 func (m *mockStore) QueuePendingDM(_ context.Context, dm *state.PendingDM) error {
 	m.pendingDMs = append(m.pendingDMs, dm)
 	return nil
