@@ -139,8 +139,11 @@ func (m *Manager) processPendingDMs(ctx context.Context) {
 
 			// Increment retry count and schedule next retry with exponential backoff
 			dm.RetryCount++
-			retryDelay := baseRetryDelay * time.Duration(1<<uint(dm.RetryCount)) // Exponential backoff: 2min, 4min, 8min, 16min, ...
-			retryDelay = min(retryDelay, 60*time.Minute)                         // Cap at 1 hour
+			// Safe exponential backoff: cap the exponent to prevent overflow
+			// Max exponent is 10 (2^10 = 1024 minutes = ~17 hours)
+			exponent := min(dm.RetryCount, 10)
+			retryDelay := baseRetryDelay * time.Duration(1<<exponent) // Exponential backoff: 2min, 4min, 8min, 16min, ...
+			retryDelay = min(retryDelay, 60*time.Minute)              // Cap at 1 hour
 			dm.SendAt = now.Add(retryDelay)
 
 			// Update the pending DM with new retry info

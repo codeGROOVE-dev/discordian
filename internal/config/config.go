@@ -53,12 +53,14 @@ func (c *DiscordConfig) GetUsers() map[string]string {
 type GlobalConfig struct {
 	GuildID         string `yaml:"guild_id"`
 	ReminderDMDelay int    `yaml:"reminder_dm_delay"`
+	When            string `yaml:"when"` // When to post threads: "immediate" (default), "assigned", "blocked", "passing"
 }
 
 // ChannelConfig holds per-channel settings.
 type ChannelConfig struct {
 	Repos           []string `yaml:"repos"`
 	ReminderDMDelay *int     `yaml:"reminder_dm_delay"`
+	When            *string  `yaml:"when"` // Optional: when to post threads ("immediate", "assigned", "blocked", "passing")
 	Type            string   `yaml:"type"` // "forum" or "text"
 	Mute            bool     `yaml:"mute"`
 }
@@ -404,6 +406,30 @@ func (m *Manager) ReminderDMDelay(org, channel string) int {
 		return cfg.Global.ReminderDMDelay
 	}
 	return defaultReminderDMDelayMinutes
+}
+
+// When returns the posting threshold for a channel.
+// Returns "immediate" (default), "assigned", "blocked", or "passing".
+func (m *Manager) When(org, channel string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cfg, exists := m.configs[org]
+	if !exists {
+		return "immediate" // Default
+	}
+
+	// Check for channel-specific override
+	if channelCfg, ok := cfg.Channels[channel]; ok && channelCfg.When != nil {
+		return *channelCfg.When
+	}
+
+	// Return global setting (or default if not set)
+	if cfg.Global.When != "" {
+		return cfg.Global.When
+	}
+
+	return "immediate" // Default
 }
 
 // GuildID returns the guild ID for an organization.

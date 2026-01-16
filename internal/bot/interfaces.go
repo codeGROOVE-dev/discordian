@@ -51,6 +51,7 @@ type ConfigManager interface {
 	ChannelType(org, channel string) string
 	DiscordUserID(org, githubUsername string) string
 	ReminderDMDelay(org, channel string) int
+	When(org, channel string) string
 	GuildID(org string) string
 	SetGitHubClient(org string, client any)
 }
@@ -95,6 +96,7 @@ type PRInfo struct {
 	Draft     bool     `json:"draft"`
 	Merged    bool     `json:"merged"`
 	Closed    bool     `json:"closed"`
+	Assignees []string `json:"assignees,omitempty"`
 }
 
 // Analysis contains the PR analysis result.
