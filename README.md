@@ -10,7 +10,7 @@ The Discord integration for [reviewGOOSE](https://codegroove.dev/reviewgoose/) �
 - Smart notifications: Delays DMs if user already notified in channel
 - Channel auto-discovery: repos automatically map to same-named channels
 - Configurable notification settings via YAML
-- Daily reports between 6-11:30am local time
+- Daily reports between 6am-12pm local time
 - Reliable delivery with deduplication
 
 ## Quick Start
@@ -21,7 +21,37 @@ The Discord integration for [reviewGOOSE](https://codegroove.dev/reviewgoose/) �
 - Discord server admin access
 - Discord Developer Mode enabled (Settings → Advanced → Developer Mode)
 
-### 1. Add the Bot to Your Server
+### 1. Install the GitHub App
+
+Install the [reviewGOOSE GitHub App](https://github.com/apps/reviewgoose) on your organization.
+
+### 2. Get Your Discord Server ID
+
+**Enable Developer Mode** (if not already enabled):
+1. Open Discord Settings (gear icon)
+2. Go to Advanced (under App Settings)
+3. Enable "Developer Mode"
+
+**Get Server ID**: Right-click your server name → Copy Server ID
+
+### 3. Create Configuration Repository
+
+Create a repository named `.codeGROOVE` in your GitHub organization.
+
+### 4. Add Configuration File
+
+Create `.codeGROOVE/discord.yaml`:
+
+```yaml
+global:
+  guild_id: "YOUR_DISCORD_SERVER_ID"
+
+# Optional: Add explicit user mappings if GitHub/Discord usernames differ
+# users:
+#   github-username: "discord-user-id"
+```
+
+### 5. Add the Bot to Your Server
 
 [Add reviewGOOSE to Discord](https://discord.com/oauth2/authorize?client_id=1461368540190871831&permissions=2147485696&scope=bot%20applications.commands)
 
@@ -31,37 +61,6 @@ The Discord integration for [reviewGOOSE](https://codegroove.dev/reviewgoose/) �
   1. Right-click channel → Edit Channel → Permissions
   2. Click "+" → Select reviewGOOSE bot
   3. Enable "View Channel" permission
-
-### 2. Install the GitHub App
-
-Install the [reviewGOOSE GitHub App](https://github.com/apps/reviewgoose) on your organization.
-
-### 3. Get Your Discord IDs
-
-**Enable Developer Mode** (if not already enabled):
-1. Open Discord Settings (gear icon)
-2. Go to Advanced (under App Settings)
-3. Enable "Developer Mode"
-
-**Get Server ID**: Right-click your server name → Copy Server ID
-**Get User IDs**: Right-click any username → Copy User ID
-
-### 4. Create Configuration Repository
-
-Create a repository named `.codeGROOVE` in your GitHub organization.
-
-### 5. Add Configuration File
-
-Create `.codeGROOVE/discord.yaml`:
-
-```yaml
-global:
-  guild_id: "YOUR_DISCORD_SERVER_ID"
-
-users:
-  github-username: "discord-user-id"
-  another-user: "discord-user-id"
-```
 
 Done! The bot will post PR notifications to channels matching your repository names (e.g., `api` repo → `#api` channel).
 
@@ -75,8 +74,18 @@ global:
   reminder_dm_delay: 65  # Minutes to wait before sending DM (default: 65, 0 = disabled)
 
 users:
-  alice: "111111111111111111"  # GitHub username → Discord user ID
-  bob: "222222222222222222"
+  # Simple format (string) - uses default UTC timezone
+  alice: "111111111111111111"
+
+  # Extended format with timezone for daily reports
+  bob:
+    discord_id: "222222222222222222"
+    timezone: "America/New_York"  # IANA timezone for daily reports (defaults to UTC)
+
+  charlie:
+    discord_id: "333333333333333333"
+    timezone: "Europe/London"
+
   # Unmapped users: bot attempts username match in guild
 
 channels:
@@ -111,13 +120,31 @@ channels:
 
 ## User Mapping
 
-The bot maps GitHub → Discord users in this order:
+The bot maps GitHub → Discord users using a 3-tier lookup system:
 
-1. Explicit mapping in `users:` section
-2. Username match (searches Discord guild for matching username)
-3. Fallback (mentions GitHub username as plain text)
+### 1. Explicit Config Mapping
+Checks the `users:` section in `discord.yaml`. Values can be:
+- Discord numeric ID: `"111111111111111111"`
+- Discord username: Bot will look it up in the guild
 
-Add explicit mappings for users whose Discord and GitHub usernames differ.
+### 2. Automatic Username Match
+Searches the Discord guild for the GitHub username using progressive matching. At each tier, checks both:
+- Discord **Username** (e.g., `@johndoe`)
+- Discord **Display Name** (the name shown in the member list)
+
+Matching tiers:
+- **Tier 1**: Exact match (checks Username first, then Display Name)
+- **Tier 2**: Case-insensitive match (e.g., `JohnDoe` matches `johndoe`)
+- **Tier 3**: Prefix match (e.g., `john` matches `johnsmith`) - only if unambiguous (exactly one match)
+
+### 3. Fallback
+If no match is found, mentions GitHub username as plain text (e.g., `octocat` instead of `@octocat`)
+
+---
+
+**When to add explicit mappings**: Only needed if automatic matching fails or usernames are too different
+
+**How to get Discord User IDs**: With Developer Mode enabled, right-click any username → Copy User ID
 
 ## Slash Commands
 
@@ -130,7 +157,7 @@ Add explicit mappings for users whose Discord and GitHub usernames differ.
 
 - **Channel mentions**: DMs delayed by `reminder_dm_delay` (default: 65 min)
 - **No channel access**: Immediate DM to user
-- **Daily reports**: 6-11:30am local time if user has pending PRs
+- **Daily reports**: 6am-12pm local time if user has pending PRs
 - **Anti-spam**: Rate limiting prevents notification floods
 
 ## Troubleshooting

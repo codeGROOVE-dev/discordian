@@ -29,6 +29,7 @@ type DiscordClient interface {
 	LookupUserByUsername(ctx context.Context, username string) string
 	IsBotInChannel(ctx context.Context, channelID string) bool
 	IsUserInGuild(ctx context.Context, userID string) bool
+	IsUserActive(ctx context.Context, userID string) bool
 	IsForumChannel(ctx context.Context, channelID string) bool
 
 	// Guild info

@@ -14,14 +14,8 @@ import (
 )
 
 const (
-	// MinHoursBetweenReports is the minimum time between daily reports (23 hours).
-	MinHoursBetweenReports = 23
-
-	// WindowStartHour is when the daily report window opens (6am local time).
-	WindowStartHour = 6
-
-	// WindowEndHour is when the daily report window closes (before noon).
-	WindowEndHour = 12
+	// MinHoursBetweenReports is the minimum time between daily reports (20 hours).
+	MinHoursBetweenReports = 20
 )
 
 // UserBlockingInfo contains information about PRs a user is blocking.
@@ -29,7 +23,6 @@ type UserBlockingInfo struct {
 	GitHubUsername string
 	DiscordUserID  string
 	GuildID        string
-	Timezone       string // IANA timezone name, defaults to "UTC"
 	IncomingPRs    []discord.PRSummary
 	OutgoingPRs    []discord.PRSummary
 }
@@ -70,6 +63,7 @@ func (s *Sender) RegisterGuild(guildID string, sender DiscordDMSender) {
 }
 
 // ShouldSendReport determines if a report should be sent to a user now.
+// Note: Caller should check if user is active before calling this.
 func (s *Sender) ShouldSendReport(ctx context.Context, userInfo UserBlockingInfo) bool {
 	// Must have PRs to report
 	if len(userInfo.IncomingPRs) == 0 && len(userInfo.OutgoingPRs) == 0 {
@@ -87,40 +81,6 @@ func (s *Sender) ShouldSendReport(ctx context.Context, userInfo UserBlockingInfo
 				"min_hours", MinHoursBetweenReports)
 			return false
 		}
-	}
-
-	// Get user's timezone (default to UTC)
-	tzName := userInfo.Timezone
-	if tzName == "" {
-		tzName = "UTC"
-	}
-
-	// Parse timezone
-	loc, err := time.LoadLocation(tzName)
-	if err != nil {
-		s.logger.Debug("invalid timezone, using UTC",
-			"user", userInfo.DiscordUserID,
-			"timezone", tzName,
-			"error", err)
-		loc = time.UTC
-	}
-
-	// Check if it's within the 6am-11:30am window in user's timezone
-	now := time.Now().In(loc)
-	h := now.Hour()
-	m := now.Minute()
-
-	// Window is 6:00am - 11:29am (before 11:30am)
-	outsideWindow := h < WindowStartHour ||
-		h >= WindowEndHour ||
-		(h == 11 && m >= 30)
-
-	if outsideWindow {
-		s.logger.Debug("skipping report - outside time window",
-			"user", userInfo.DiscordUserID,
-			"time", fmt.Sprintf("%02d:%02d", h, m),
-			"window", "6:00am-11:29am")
-		return false
 	}
 
 	return true

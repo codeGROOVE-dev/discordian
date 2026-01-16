@@ -12,8 +12,11 @@ import (
 
 const (
 	checkInterval     = time.Minute
-	minDMInterval     = time.Minute // Minimum time between DMs to same user
-	dmRetentionPeriod = 90 * 24 * time.Hour
+	minDMInterval     = time.Minute          // Minimum time between DMs to same user
+	dmRetentionPeriod = 90 * 24 * time.Hour  // How long to keep DM history
+	dmTTL             = 7 * 24 * time.Hour   // Expire pending DMs after 7 days
+	maxRetries        = 10                   // Maximum retry attempts before giving up
+	baseRetryDelay    = time.Minute          // Initial retry delay, doubles each attempt
 )
 
 // DiscordDMSender defines the interface for sending DMs.
@@ -99,13 +102,60 @@ func (m *Manager) processPendingDMs(ctx context.Context) {
 
 	m.logger.Debug("processing pending DMs", "count", len(dms))
 
+	now := time.Now()
 	for _, dm := range dms {
+		// Check if DM has expired
+		if !dm.ExpiresAt.IsZero() && now.After(dm.ExpiresAt) {
+			m.logger.Warn("removing expired pending DM",
+				"user_id", dm.UserID,
+				"pr_url", dm.PRURL,
+				"created_at", dm.CreatedAt,
+				"expired_at", dm.ExpiresAt)
+			if err := m.store.RemovePendingDM(ctx, dm.ID); err != nil {
+				m.logger.Warn("failed to remove expired DM", "error", err, "id", dm.ID)
+			}
+			continue
+		}
+
+		// Check if max retries exceeded
+		if dm.RetryCount >= maxRetries {
+			m.logger.Error("removing pending DM after max retries",
+				"user_id", dm.UserID,
+				"pr_url", dm.PRURL,
+				"retry_count", dm.RetryCount,
+				"max_retries", maxRetries)
+			if err := m.store.RemovePendingDM(ctx, dm.ID); err != nil {
+				m.logger.Warn("failed to remove failed DM", "error", err, "id", dm.ID)
+			}
+			continue
+		}
+
 		if err := m.sendDM(ctx, dm); err != nil {
 			m.logger.Error("failed to send DM",
 				"error", err,
 				"user_id", dm.UserID,
-				"pr_url", dm.PRURL)
-			// Keep in queue to retry later
+				"pr_url", dm.PRURL,
+				"retry_count", dm.RetryCount)
+
+			// Increment retry count and schedule next retry with exponential backoff
+			dm.RetryCount++
+			retryDelay := baseRetryDelay * time.Duration(1<<uint(dm.RetryCount)) // Exponential backoff: 2min, 4min, 8min, 16min, ...
+			if retryDelay > 60*time.Minute {
+				retryDelay = 60 * time.Minute // Cap at 1 hour
+			}
+			dm.SendAt = now.Add(retryDelay)
+
+			// Update the pending DM with new retry info
+			if err := m.store.QueuePendingDM(ctx, dm); err != nil {
+				m.logger.Error("failed to update pending DM retry info", "error", err, "id", dm.ID)
+			} else {
+				m.logger.Info("scheduled DM retry with exponential backoff",
+					"user_id", dm.UserID,
+					"pr_url", dm.PRURL,
+					"retry_count", dm.RetryCount,
+					"next_attempt", dm.SendAt,
+					"delay", retryDelay)
+			}
 			continue
 		}
 

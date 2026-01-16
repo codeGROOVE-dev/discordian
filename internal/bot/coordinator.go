@@ -692,14 +692,18 @@ func (c *Coordinator) processDMForUser(
 	}
 
 	// Queue the DM
+	now := time.Now()
 	dm := &state.PendingDM{
 		ID:          uuid.New().String(),
 		UserID:      discordID,
 		PRURL:       prURL,
 		MessageText: newMessage,
 		SendAt:      sendAt,
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(7 * 24 * time.Hour), // Expire after 7 days
 		GuildID:     c.discord.GuildID(),
 		Org:         c.org,
+		RetryCount:  0,
 	}
 
 	if err := c.store.QueuePendingDM(ctx, dm); err != nil {
@@ -1137,16 +1141,19 @@ func (c *Coordinator) checkUserDailyReport(
 		return
 	}
 
-	// TODO: Get user's timezone from Discord or config
-	// For now, default to UTC
-	timezone := "UTC"
+	// Check if user is currently active on Discord
+	if !c.discord.IsUserActive(ctx, discordID) {
+		c.logger.Debug("skipping daily report - user not active",
+			"github_user", githubUsername,
+			"discord_id", discordID)
+		return
+	}
 
 	// Build user blocking info
 	userInfo := dailyreport.UserBlockingInfo{
 		GitHubUsername: githubUsername,
 		DiscordUserID:  discordID,
 		GuildID:        guildID,
-		Timezone:       timezone,
 		IncomingPRs:    incomingPRs,
 		OutgoingPRs:    outgoingPRs,
 	}
