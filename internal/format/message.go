@@ -142,10 +142,22 @@ func ChannelMessage(p ChannelMessageParams) string {
 	sb.WriteString(" · ")
 	sb.WriteString(p.Author)
 
+	// State text (e.g., "tests pending", "needs review")
+	stateText := StateText(p.State)
+	if stateText != "" {
+		sb.WriteString(" • ")
+		sb.WriteString(stateText)
+	}
+
 	// Action users - group by action
 	actionSuffix := ActionGroups(p.ActionUsers)
 	if actionSuffix != "" {
-		sb.WriteString(" • ")
+		// Use semicolon separator if state text already present, otherwise bullet
+		if stateText != "" {
+			sb.WriteString("; ")
+		} else {
+			sb.WriteString(" • ")
+		}
 		sb.WriteString(actionSuffix)
 	}
 

@@ -19,6 +19,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// TokenProvider provides fresh GitHub installation tokens.
+type TokenProvider interface {
+	InstallationToken(ctx context.Context) (string, error)
+}
+
 const (
 	// Ping/pong intervals.
 	pingInterval = 30 * time.Second
@@ -32,28 +37,28 @@ const (
 
 // SprinklerClient manages the WebSocket connection to sprinkler.
 type SprinklerClient struct {
-	logger       *slog.Logger
-	onEvent      func(SprinklerEvent)
-	onConnect    func()
-	onDisconnect func(error)
-	conn         *websocket.Conn
-	stopCh       chan struct{}
-	serverURL    string
-	token        string
-	organization string
-	mu           sync.RWMutex
-	stopOnce     sync.Once
+	logger        *slog.Logger
+	onEvent       func(SprinklerEvent)
+	onConnect     func()
+	onDisconnect  func(error)
+	conn          *websocket.Conn
+	stopCh        chan struct{}
+	serverURL     string
+	tokenProvider TokenProvider
+	organization  string
+	mu            sync.RWMutex
+	stopOnce      sync.Once
 }
 
 // SprinklerConfig holds configuration for the sprinkler client.
 type SprinklerConfig struct {
-	Logger       *slog.Logger
-	OnEvent      func(SprinklerEvent)
-	OnConnect    func()
-	OnDisconnect func(error)
-	ServerURL    string
-	Token        string
-	Organization string
+	Logger        *slog.Logger
+	OnEvent       func(SprinklerEvent)
+	OnConnect     func()
+	OnDisconnect  func(error)
+	ServerURL     string
+	TokenProvider TokenProvider
+	Organization  string
 }
 
 // NewSprinklerClient creates a new sprinkler WebSocket client.
@@ -64,8 +69,8 @@ func NewSprinklerClient(cfg SprinklerConfig) (*SprinklerClient, error) {
 	if cfg.Organization == "" {
 		return nil, errors.New("organization is required")
 	}
-	if cfg.Token == "" {
-		return nil, errors.New("token is required")
+	if cfg.TokenProvider == nil {
+		return nil, errors.New("tokenProvider is required")
 	}
 
 	logger := cfg.Logger
@@ -74,14 +79,14 @@ func NewSprinklerClient(cfg SprinklerConfig) (*SprinklerClient, error) {
 	}
 
 	return &SprinklerClient{
-		serverURL:    cfg.ServerURL,
-		token:        cfg.Token,
-		organization: cfg.Organization,
-		onEvent:      cfg.OnEvent,
-		onConnect:    cfg.OnConnect,
-		onDisconnect: cfg.OnDisconnect,
-		logger:       logger,
-		stopCh:       make(chan struct{}),
+		serverURL:     cfg.ServerURL,
+		tokenProvider: cfg.TokenProvider,
+		organization:  cfg.Organization,
+		onEvent:       cfg.OnEvent,
+		onConnect:     cfg.OnConnect,
+		onDisconnect:  cfg.OnDisconnect,
+		logger:        logger,
+		stopCh:        make(chan struct{}),
 	}, nil
 }
 
@@ -149,12 +154,18 @@ func (c *SprinklerClient) Stop() {
 func (c *SprinklerClient) connect(ctx context.Context) error {
 	c.logger.Info("connecting to sprinkler", "url", c.serverURL, "org", c.organization)
 
+	// Get fresh token for this connection
+	token, err := c.tokenProvider.InstallationToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get fresh token: %w", err)
+	}
+
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
 
 	header := http.Header{}
-	header.Set("Authorization", "Bearer "+c.token)
+	header.Set("Authorization", "Bearer "+token)
 
 	conn, resp, err := dialer.DialContext(ctx, c.serverURL, header)
 	if resp != nil && resp.Body != nil {
@@ -306,10 +317,11 @@ func (c *SprinklerClient) readLoop(ctx context.Context, conn *websocket.Conn) er
 		// Parse event
 		event := SprinklerEvent{
 			Type: msgType,
+			Raw:  msg,
 		}
 
-		if url, ok := msg["url"].(string); ok {
-			event.URL = url
+		if eventURL, ok := msg["url"].(string); ok {
+			event.URL = eventURL
 		}
 
 		if ts, ok := msg["timestamp"].(string); ok {
@@ -326,15 +338,17 @@ func (c *SprinklerClient) readLoop(ctx context.Context, conn *websocket.Conn) er
 			event.CommitSHA = commitSHA
 		}
 
-		// Skip events without PR URL
-		if event.URL == "" || !strings.Contains(event.URL, "/pull/") {
+		// Skip events without URL (shouldn't happen but be defensive)
+		if event.URL == "" {
+			c.logger.Debug("skipping event without URL", "type", event.Type)
 			continue
 		}
 
 		c.logger.Debug("received event",
 			"type", event.Type,
 			"url", event.URL,
-			"delivery_id", event.DeliveryID)
+			"delivery_id", event.DeliveryID,
+			"commit_sha", event.CommitSHA)
 
 		if c.onEvent != nil {
 			c.onEvent(event)
@@ -417,17 +431,17 @@ func FormatPRURL(owner, repo string, number int) string {
 
 // TurnHTTPClient implements TurnClient using HTTP.
 type TurnHTTPClient struct {
-	client  *http.Client
-	baseURL string
-	token   string
+	client        *http.Client
+	baseURL       string
+	tokenProvider TokenProvider
 }
 
 // NewTurnClient creates a new Turn API client.
-func NewTurnClient(baseURL, token string) *TurnHTTPClient {
+func NewTurnClient(baseURL string, tokenProvider TokenProvider) *TurnHTTPClient {
 	return &TurnHTTPClient{
-		baseURL: strings.TrimSuffix(baseURL, "/"),
-		token:   token,
-		client:  &http.Client{Timeout: 30 * time.Second},
+		baseURL:       strings.TrimSuffix(baseURL, "/"),
+		tokenProvider: tokenProvider,
+		client:        &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -496,13 +510,19 @@ func (c *TurnHTTPClient) Check(ctx context.Context, prURL, username string, upda
 
 // doTurnRequest performs a single Turn API request.
 func (c *TurnHTTPClient) doTurnRequest(ctx context.Context, body []byte, prURL string, result *CheckResponse) error {
+	// Get fresh token for this request
+	token, err := c.tokenProvider.InstallationToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get fresh token: %w", err)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/validate", strings.NewReader(string(body)))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

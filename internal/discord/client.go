@@ -577,17 +577,17 @@ func (c *Client) IsUserActive(ctx context.Context, userID string) bool {
 		return false
 	}
 
-	// Get presence for the user in the guild
-	presences, err := c.session.State.Presences(guildID)
+	// Get guild from state
+	guild, err := c.session.State.Guild(guildID)
 	if err != nil {
-		slog.Debug("failed to get presences",
+		slog.Debug("failed to get guild from state",
 			"guild_id", guildID,
 			"error", err)
 		return false
 	}
 
 	// Find user's presence
-	for _, p := range presences {
+	for _, p := range guild.Presences {
 		if p.User.ID == userID {
 			// Consider "online", "idle", and "dnd" as active
 			// "offline" or "" means not active

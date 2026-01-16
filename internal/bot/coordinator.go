@@ -121,9 +121,7 @@ func (c *Coordinator) ProcessEvent(ctx context.Context, event SprinklerEvent) {
 		return
 	}
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+	c.wg.Go(func() {
 		defer func() { <-c.eventSem }()
 
 		if err := c.processEventSync(ctx, event); err != nil {
@@ -132,7 +130,7 @@ func (c *Coordinator) ProcessEvent(ctx context.Context, event SprinklerEvent) {
 				"url", event.URL,
 				"type", event.Type)
 		}
-	}()
+	})
 }
 
 func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent) error {
@@ -341,14 +339,14 @@ func (c *Coordinator) processForumChannel(
 			// Update state
 			threadInfo.MessageText = content
 			threadInfo.LastState = string(params.State)
-			if saveErr := c.store.SaveThread(ctx, owner, repo, number, channelID, threadInfo); saveErr != nil {
-				c.logger.Warn("failed to save thread info", "error", saveErr)
+			if err := c.store.SaveThread(ctx, owner, repo, number, channelID, threadInfo); err != nil {
+				c.logger.Warn("failed to save thread info", "error", err)
 			}
 
 			// Archive if merged/closed
 			if params.State == format.StateMerged || params.State == format.StateClosed {
-				if archiveErr := c.discord.ArchiveThread(ctx, threadInfo.ThreadID); archiveErr != nil {
-					c.logger.Warn("failed to archive thread", "error", archiveErr)
+				if err := c.discord.ArchiveThread(ctx, threadInfo.ThreadID); err != nil {
+					c.logger.Warn("failed to archive thread", "error", err)
 				}
 			}
 
@@ -438,8 +436,8 @@ func (c *Coordinator) processTextChannel(
 		if err == nil {
 			threadInfo.MessageText = content
 			threadInfo.LastState = string(params.State)
-			if saveErr := c.store.SaveThread(ctx, owner, repo, number, channelID, threadInfo); saveErr != nil {
-				c.logger.Warn("failed to save thread info", "error", saveErr)
+			if err := c.store.SaveThread(ctx, owner, repo, number, channelID, threadInfo); err != nil {
+				c.logger.Warn("failed to save thread info", "error", err)
 			}
 
 			c.trackTaggedUsers(params)
@@ -653,8 +651,8 @@ func (c *Coordinator) processDMForUser(
 			dmInfo.MessageText = newMessage
 			dmInfo.LastState = string(prState)
 			dmInfo.SentAt = time.Now()
-			if saveErr := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); saveErr != nil {
-				c.logger.Warn("failed to save updated DM info", "error", saveErr)
+			if err := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); err != nil {
+				c.logger.Warn("failed to save updated DM info", "error", err)
 			}
 			c.logger.Info("updated DM notification",
 				"user_id", discordID,

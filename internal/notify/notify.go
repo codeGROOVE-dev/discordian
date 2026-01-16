@@ -12,11 +12,11 @@ import (
 
 const (
 	checkInterval     = time.Minute
-	minDMInterval     = time.Minute          // Minimum time between DMs to same user
-	dmRetentionPeriod = 90 * 24 * time.Hour  // How long to keep DM history
-	dmTTL             = 7 * 24 * time.Hour   // Expire pending DMs after 7 days
-	maxRetries        = 10                   // Maximum retry attempts before giving up
-	baseRetryDelay    = time.Minute          // Initial retry delay, doubles each attempt
+	minDMInterval     = time.Minute         // Minimum time between DMs to same user
+	dmRetentionPeriod = 90 * 24 * time.Hour // How long to keep DM history
+	dmTTL             = 7 * 24 * time.Hour  // Expire pending DMs after 7 days
+	maxRetries        = 10                  // Maximum retry attempts before giving up
+	baseRetryDelay    = time.Minute         // Initial retry delay, doubles each attempt
 )
 
 // DiscordDMSender defines the interface for sending DMs.
@@ -140,9 +140,7 @@ func (m *Manager) processPendingDMs(ctx context.Context) {
 			// Increment retry count and schedule next retry with exponential backoff
 			dm.RetryCount++
 			retryDelay := baseRetryDelay * time.Duration(1<<uint(dm.RetryCount)) // Exponential backoff: 2min, 4min, 8min, 16min, ...
-			if retryDelay > 60*time.Minute {
-				retryDelay = 60 * time.Minute // Cap at 1 hour
-			}
+			retryDelay = min(retryDelay, 60*time.Minute)                         // Cap at 1 hour
 			dm.SendAt = now.Add(retryDelay)
 
 			// Update the pending DM with new retry info

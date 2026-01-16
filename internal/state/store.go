@@ -36,8 +36,8 @@ type PendingDM struct {
 	CreatedAt   time.Time `json:"created_at"`
 	GuildID     string    `json:"guild_id"`
 	Org         string    `json:"org"`
-	RetryCount  int       `json:"retry_count"`  // Number of failed attempts
-	ExpiresAt   time.Time `json:"expires_at"`   // TTL for old DMs
+	RetryCount  int       `json:"retry_count"` // Number of failed attempts
+	ExpiresAt   time.Time `json:"expires_at"`  // TTL for old DMs
 }
 
 // DailyReportInfo tracks daily report state for a user.
