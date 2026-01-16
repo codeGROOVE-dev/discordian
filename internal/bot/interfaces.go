@@ -85,13 +85,14 @@ type CheckResponse struct {
 
 // PRInfo contains pull request metadata.
 type PRInfo struct {
-	Title     string `json:"title"`
-	Author    string `json:"author"`
-	State     string `json:"state"`
-	UpdatedAt string `json:"updated_at"`
-	Draft     bool   `json:"draft"`
-	Merged    bool   `json:"merged"`
-	Closed    bool   `json:"closed"`
+	Title     string   `json:"title"`
+	Author    string   `json:"author"`
+	State     string   `json:"state"`
+	UpdatedAt string   `json:"updated_at"`
+	Commits   []string `json:"commits,omitempty"`
+	Draft     bool     `json:"draft"`
+	Merged    bool     `json:"merged"`
+	Closed    bool     `json:"closed"`
 }
 
 // Analysis contains the PR analysis result.
@@ -123,25 +124,18 @@ type Checks struct {
 
 // SprinklerEvent represents an event from the sprinkler WebSocket.
 type SprinklerEvent struct {
-	Type       string    `json:"type"`
-	URL        string    `json:"url"`
-	Timestamp  time.Time `json:"timestamp"`
-	DeliveryID string    `json:"delivery_id"`
-	CommitSHA  string    `json:"commit_sha,omitempty"`
+	Timestamp  time.Time      `json:"timestamp"`
+	Raw        map[string]any `json:"-"` // Raw message for additional fields
+	Type       string         `json:"type"`
+	URL        string         `json:"url"`
+	DeliveryID string         `json:"delivery_id"`
+	CommitSHA  string         `json:"commit_sha,omitempty"`
 }
 
 // UserMapper defines user mapping operations.
 type UserMapper interface {
 	DiscordID(ctx context.Context, githubUsername string) string
 	Mention(ctx context.Context, githubUsername string) string
-}
-
-// NotificationTracker tracks who has been notified.
-type NotificationTracker interface {
-	WasTaggedInChannel(prURL, userID string) bool
-	MarkTaggedInChannel(prURL, userID string)
-	LastDMTime(userID, prURL string) time.Time
-	MarkDMSent(userID, prURL string)
 }
 
 // PRSearcher queries GitHub for PRs.

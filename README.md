@@ -10,7 +10,7 @@ The Discord integration for [reviewGOOSE](https://codegroove.dev/reviewgoose/) â
 - Smart notifications: Delays DMs if user already notified in channel
 - Channel auto-discovery: repos automatically map to same-named channels
 - Configurable notification settings via YAML
-- Daily reports between 6am-12pm local time
+- Activity-based reports when you come online
 - Reliable delivery with deduplication
 
 ## Quick Start
@@ -74,18 +74,8 @@ global:
   reminder_dm_delay: 65  # Minutes to wait before sending DM (default: 65, 0 = disabled)
 
 users:
-  # Simple format (string) - uses default UTC timezone
-  alice: "111111111111111111"
-
-  # Extended format with timezone for daily reports
-  bob:
-    discord_id: "222222222222222222"
-    timezone: "America/New_York"  # IANA timezone for daily reports (defaults to UTC)
-
-  charlie:
-    discord_id: "333333333333333333"
-    timezone: "Europe/London"
-
+  alice: "111111111111111111"  # GitHub username â†’ Discord user ID
+  bob: "222222222222222222"
   # Unmapped users: bot attempts username match in guild
 
 channels:
@@ -157,7 +147,7 @@ If no match is found, mentions GitHub username as plain text (e.g., `octocat` in
 
 - **Channel mentions**: DMs delayed by `reminder_dm_delay` (default: 65 min)
 - **No channel access**: Immediate DM to user
-- **Daily reports**: 6am-12pm local time if user has pending PRs
+- **Activity reports**: Sent when you come online if you have pending PRs and 20+ hours since last report
 - **Anti-spam**: Rate limiting prevents notification floods
 
 ## Troubleshooting

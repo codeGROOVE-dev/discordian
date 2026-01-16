@@ -217,7 +217,11 @@ func runCoordinators(
 
 	// Initial discovery
 	slog.Info("discovering GitHub installations")
-	cm.refreshAndStart(ctx)
+	if err := cm.githubManager.RefreshInstallations(ctx); err != nil {
+		slog.Error("failed to refresh GitHub installations", "error", err)
+	} else {
+		cm.startCoordinators(ctx)
+	}
 
 	// Periodic refresh every 5 minutes
 	refreshTicker := time.NewTicker(5 * time.Minute)
@@ -237,10 +241,24 @@ func runCoordinators(
 			return cm.shutdown()
 
 		case <-refreshTicker.C:
-			cm.refreshAndStart(ctx)
+			if err := cm.githubManager.RefreshInstallations(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("failed to refresh GitHub installations", "error", err)
+			} else {
+				cm.startCoordinators(ctx)
+			}
 
 		case <-retryTicker.C:
-			cm.retryFailed(ctx)
+			cm.mu.Lock()
+			failedCount := len(cm.failed)
+			cm.mu.Unlock()
+			if failedCount > 0 {
+				slog.Info("retrying failed coordinators", "count", failedCount)
+				if err := cm.githubManager.RefreshInstallations(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Error("failed to refresh GitHub installations", "error", err)
+				} else {
+					cm.startCoordinators(ctx)
+				}
+			}
 
 		case <-cleanupTicker.C:
 			if err := store.Cleanup(ctx); err != nil {
@@ -250,16 +268,6 @@ func runCoordinators(
 	}
 }
 
-func (cm *coordinatorManager) refreshAndStart(ctx context.Context) {
-	if err := cm.githubManager.RefreshInstallations(ctx); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			slog.Error("failed to refresh GitHub installations", "error", err)
-		}
-		return
-	}
-
-	cm.startCoordinators(ctx)
-}
 
 func (cm *coordinatorManager) startCoordinators(ctx context.Context) {
 	cm.mu.Lock()
@@ -336,16 +344,8 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 	// Create user mapper
 	userMapper := usermapping.New(org, cm.configManager, discordClient)
 
-	// Get GitHub token for sprinkler
-	ghToken, err := ghClient.InstallationToken(ctx)
-	if err != nil {
-		slog.Error("failed to get GitHub token", "org", org, "error", err)
-		cm.failed[org] = time.Now()
-		return false
-	}
-
-	// Create Turn client
-	turnClient := bot.NewTurnClient(cm.cfg.TurnURL, ghToken)
+	// Create Turn client with token provider (will fetch fresh tokens automatically)
+	turnClient := bot.NewTurnClient(cm.cfg.TurnURL, ghClient)
 
 	// Create PR searcher for polling backup
 	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
@@ -368,17 +368,17 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 	cm.coordinators[org] = coordinator
 	delete(cm.failed, org)
 
-	go func(org string, coord *bot.Coordinator, sprinklerURL, ghToken string) {
+	go func(org string, coord *bot.Coordinator, sprinklerURL string, tokenProvider bot.TokenProvider) {
 		slog.Info("starting coordinator",
 			"org", org,
 			"guild_id", guildID,
 			"sprinkler_url", sprinklerURL)
 
-		// Create sprinkler client
+		// Create sprinkler client with token provider (will fetch fresh tokens automatically)
 		sprinklerClient, err := bot.NewSprinklerClient(bot.SprinklerConfig{
-			ServerURL:    sprinklerURL,
-			Token:        ghToken,
-			Organization: org,
+			ServerURL:     sprinklerURL,
+			TokenProvider: tokenProvider,
+			Organization:  org,
 			OnEvent: func(event bot.SprinklerEvent) {
 				coord.ProcessEvent(orgCtx, event)
 				// Track last event time
@@ -431,7 +431,7 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 				return
 			}
 		}
-	}(org, coordinator, cm.cfg.SprinklerURL, ghToken)
+	}(org, coordinator, cm.cfg.SprinklerURL, ghClient)
 
 	return true
 }
@@ -493,18 +493,6 @@ func (cm *coordinatorManager) handleCoordinatorExit(org string, err error) {
 	delete(cm.coordinators, org)
 }
 
-func (cm *coordinatorManager) retryFailed(ctx context.Context) {
-	cm.mu.Lock()
-	failedCount := len(cm.failed)
-	cm.mu.Unlock()
-
-	if failedCount == 0 {
-		return
-	}
-
-	slog.Info("retrying failed coordinators", "count", failedCount)
-	cm.refreshAndStart(ctx)
-}
 
 func (cm *coordinatorManager) shutdown() error {
 	cm.mu.Lock()
@@ -538,14 +526,14 @@ func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discor
 		UptimeSeconds: int64(time.Since(cm.startTime).Seconds()),
 	}
 
-	// Find orgs for this guild
-	var orgForGuild string
+	// Find all orgs for this guild (a guild may monitor multiple orgs)
+	var orgsForGuild []string
 	for org := range cm.active {
 		status.ConnectedOrgs = append(status.ConnectedOrgs, org)
 
 		cfg, exists := cm.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
-			orgForGuild = org
+			orgsForGuild = append(orgsForGuild, org)
 		}
 	}
 
@@ -555,19 +543,27 @@ func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discor
 		status.PendingDMs = len(pendingDMs)
 	}
 
-	// Get last event time for this guild's org
-	if orgForGuild != "" {
-		if lastEvent, exists := cm.lastEventTime[orgForGuild]; exists {
-			status.LastEventTime = lastEvent.Format(time.RFC3339)
+	// Aggregate data from all orgs for this guild
+	var lastEventTime time.Time
+	for _, org := range orgsForGuild {
+		// Track most recent event across all orgs
+		if lastEvent, exists := cm.lastEventTime[org]; exists {
+			if lastEvent.After(lastEventTime) {
+				lastEventTime = lastEvent
+			}
 		}
 
-		// Get configured repos and channels
-		if cfg, exists := cm.configManager.Config(orgForGuild); exists {
+		// Collect channels and repos from all orgs
+		if cfg, exists := cm.configManager.Config(org); exists {
 			for channelName, channelConfig := range cfg.Channels {
 				status.WatchedChannels = append(status.WatchedChannels, channelName)
 				status.ConfiguredRepos = append(status.ConfiguredRepos, channelConfig.Repos...)
 			}
 		}
+	}
+
+	if !lastEventTime.IsZero() {
+		status.LastEventTime = lastEventTime.Format(time.RFC3339)
 	}
 
 	return status
@@ -578,19 +574,31 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Find the org for this guild
-	var orgForGuild string
+	// Find all orgs for this guild (a guild may monitor multiple orgs)
+	var orgsForGuild []string
+	var allOrgs []string
 	for org := range cm.active {
+		allOrgs = append(allOrgs, org)
 		cfg, exists := cm.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
-			orgForGuild = org
-			break
+			orgsForGuild = append(orgsForGuild, org)
 		}
 	}
 
-	if orgForGuild == "" {
+	if len(orgsForGuild) == 0 {
+		slog.Error("no org found for guild - report generation failed",
+			"guild_id", guildID,
+			"user_id", userID,
+			"active_orgs", allOrgs,
+			"active_org_count", len(cm.active))
 		return nil, fmt.Errorf("no org found for guild %s", guildID)
 	}
+
+	slog.Debug("generating report",
+		"guild_id", guildID,
+		"user_id", userID,
+		"orgs", orgsForGuild,
+		"org_count", len(orgsForGuild))
 
 	// Get the Discord client for username lookup
 	discordClient, exists := cm.discordClients[guildID]
@@ -598,24 +606,27 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		return nil, fmt.Errorf("no Discord client found for guild %s", guildID)
 	}
 
-	// Get config for this org
-	cfg, exists := cm.configManager.Config(orgForGuild)
-	if !exists {
-		return nil, fmt.Errorf("no config found for org %s", orgForGuild)
-	}
-
-	// Try to find GitHub username from user mappings in config
+	// Try to determine GitHub username from Discord user ID
+	// Check all org configs for user mappings
 	var githubUsername string
-	for ghUser, discordID := range cfg.Users {
-		if discordID == userID {
-			githubUsername = ghUser
+	for _, org := range orgsForGuild {
+		cfg, exists := cm.configManager.Config(org)
+		if !exists {
+			continue
+		}
+		for ghUser, discordID := range cfg.Users {
+			if discordID == userID {
+				githubUsername = ghUser
+				break
+			}
+		}
+		if githubUsername != "" {
 			break
 		}
 	}
 
 	if githubUsername == "" {
 		// Try username-based lookup (Discord username == GitHub username)
-		// Get all guild members and find this user
 		members, err := discordClient.Session().GuildMembers(guildID, "", 1000)
 		if err == nil {
 			for _, member := range members {
@@ -631,86 +642,87 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		return nil, errors.New("could not map Discord user to GitHub username")
 	}
 
-	// Get the PR searcher from the coordinator (we don't expose this currently)
-	// For now, we'll need to search open PRs and filter for this user
-	ghClient, exists := cm.githubManager.ClientForOrg(orgForGuild)
-	if !exists {
-		return nil, fmt.Errorf("no GitHub client for org %s", orgForGuild)
-	}
-
-	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
-	openPRs, err := searcher.ListOpenPRs(ctx, orgForGuild, 24)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list PRs: %w", err)
-	}
-
-	// Get GitHub token for Turn API calls
-	ghToken, err := ghClient.InstallationToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get GitHub token: %w", err)
-	}
-
-	turnClient := bot.NewTurnClient(cm.cfg.TurnURL, ghToken)
-
+	// Aggregate PRs from all orgs for this guild
 	var incomingPRs []discord.PRSummary
 	var outgoingPRs []discord.PRSummary
 
-	// Analyze each PR for this user
-	for _, pr := range openPRs {
-		prInfo, ok := bot.ParsePRURL(pr.URL)
-		if !ok {
+	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
+
+	for _, org := range orgsForGuild {
+		// Get GitHub client for this org
+		ghClient, exists := cm.githubManager.ClientForOrg(org)
+		if !exists {
+			slog.Warn("no GitHub client for org, skipping", "org", org)
 			continue
 		}
 
-		// Call Turn API to analyze this PR for this user
-		checkResp, err := turnClient.Check(ctx, pr.URL, githubUsername, pr.UpdatedAt)
+		// Search open PRs in this org
+		openPRs, err := searcher.ListOpenPRs(ctx, org, 24)
 		if err != nil {
+			slog.Warn("failed to list PRs for org", "org", org, "error", err)
 			continue
 		}
 
-		// Determine PR state
-		prState := format.StateFromAnalysis(format.StateAnalysisParams{
-			Merged:             checkResp.PullRequest.Merged,
-			Closed:             checkResp.PullRequest.Closed,
-			Draft:              checkResp.PullRequest.Draft,
-			MergeConflict:      checkResp.Analysis.MergeConflict,
-			Approved:           checkResp.Analysis.Approved,
-			ChecksFailing:      checkResp.Analysis.Checks.Failing,
-			ChecksPending:      checkResp.Analysis.Checks.Pending,
-			ChecksWaiting:      checkResp.Analysis.Checks.Waiting,
-			UnresolvedComments: checkResp.Analysis.UnresolvedComments,
-			WorkflowState:      checkResp.Analysis.WorkflowState,
-		})
+		// Create Turn client for this org
+		turnClient := bot.NewTurnClient(cm.cfg.TurnURL, ghClient)
 
-		// Determine if PR is blocked
-		isBlocked := prState == format.StateTestsBroken ||
-			prState == format.StateChanges ||
-			prState == format.StateConflict
+		// Analyze each PR for this user
+		for _, pr := range openPRs {
+			prInfo, ok := bot.ParsePRURL(pr.URL)
+			if !ok {
+				continue
+			}
 
-		// Check if user has an action on this PR
-		action, hasAction := checkResp.Analysis.NextAction[githubUsername]
-		isAuthor := checkResp.PullRequest.Author == githubUsername
+			// Call Turn API to analyze this PR for this user
+			checkResp, err := turnClient.Check(ctx, pr.URL, githubUsername, pr.UpdatedAt)
+			if err != nil {
+				continue
+			}
 
-		summary := discord.PRSummary{
-			Repo:      prInfo.Repo,
-			Number:    prInfo.Number,
-			Title:     checkResp.PullRequest.Title,
-			Author:    checkResp.PullRequest.Author,
-			State:     string(prState),
-			URL:       pr.URL,
-			UpdatedAt: pr.UpdatedAt.Format(time.RFC3339),
-			IsBlocked: isBlocked,
-		}
+			// Determine PR state
+			prState := format.StateFromAnalysis(format.StateAnalysisParams{
+				Merged:             checkResp.PullRequest.Merged,
+				Closed:             checkResp.PullRequest.Closed,
+				Draft:              checkResp.PullRequest.Draft,
+				MergeConflict:      checkResp.Analysis.MergeConflict,
+				Approved:           checkResp.Analysis.Approved,
+				ChecksFailing:      checkResp.Analysis.Checks.Failing,
+				ChecksPending:      checkResp.Analysis.Checks.Pending,
+				ChecksWaiting:      checkResp.Analysis.Checks.Waiting,
+				UnresolvedComments: checkResp.Analysis.UnresolvedComments,
+				WorkflowState:      checkResp.Analysis.WorkflowState,
+			})
 
-		if hasAction {
-			summary.Action = format.ActionLabel(action.Kind)
-		}
+			// Determine if PR is blocked
+			isBlocked := prState == format.StateTestsBroken ||
+				prState == format.StateChanges ||
+				prState == format.StateConflict
 
-		// Categorize as incoming or outgoing
-		if isAuthor {
-			outgoingPRs = append(outgoingPRs, summary)
-		} else if hasAction {
-			incomingPRs = append(incomingPRs, summary)
+			// Check if user has an action on this PR
+			action, hasAction := checkResp.Analysis.NextAction[githubUsername]
+			isAuthor := checkResp.PullRequest.Author == githubUsername
+
+			summary := discord.PRSummary{
+				Repo:      prInfo.Repo,
+				Number:    prInfo.Number,
+				Title:     checkResp.PullRequest.Title,
+				Author:    checkResp.PullRequest.Author,
+				State:     string(prState),
+				URL:       pr.URL,
+				UpdatedAt: pr.UpdatedAt.Format(time.RFC3339),
+				IsBlocked: isBlocked,
+			}
+
+			if hasAction {
+				summary.Action = format.ActionLabel(action.Kind)
+			}
+
+			// Categorize as incoming or outgoing
+			if isAuthor {
+				outgoingPRs = append(outgoingPRs, summary)
+			} else if hasAction {
+				incomingPRs = append(incomingPRs, summary)
+			}
 		}
 	}
 
@@ -767,13 +779,13 @@ func loadConfig(ctx context.Context) (config.ServerConfig, error) {
 
 	// Validate required fields
 	if cfg.GitHubAppID == "" {
-		return cfg, errors.New("GITHUB_APP_ID is required")
+		return cfg, errors.New("GITHUB_APP_ID environment variable is required")
 	}
 	if cfg.GitHubPrivateKey == "" {
-		return cfg, errors.New("GITHUB_PRIVATE_KEY is required")
+		return cfg, errors.New("GITHUB_PRIVATE_KEY environment variable is required")
 	}
 	if cfg.DiscordBotToken == "" {
-		return cfg, errors.New("DISCORD_BOT_TOKEN is required")
+		return cfg, errors.New("DISCORD_BOT_TOKEN environment variable is required")
 	}
 
 	return cfg, nil

@@ -105,6 +105,7 @@ func TestChannelMessage(t *testing.T) {
 				"[turnserver#18]",
 				" · Add GitLab/GitTea support", // Dot delimiter before title
 				" · tstromberg",                // Dot delimiter before author
+				" • tests pending",             // State text with bullet delimiter
 			},
 		},
 		{
@@ -142,7 +143,7 @@ func TestChannelMessage(t *testing.T) {
 			},
 		},
 		{
-			name: "with action users",
+			name: "with action users and state text",
 			params: ChannelMessageParams{
 				Owner:  "org",
 				Repo:   "repo",
@@ -159,7 +160,8 @@ func TestChannelMessage(t *testing.T) {
 				EmojiChanges,
 				" · New feature",
 				" · bob",
-				" • **review** → <@123>", // Action users (no state text)
+				" • changes requested",  // State text
+				"; **review** → <@123>", // Action users with semicolon separator
 			},
 		},
 		{
@@ -177,6 +179,27 @@ func TestChannelMessage(t *testing.T) {
 				EmojiApproved,
 				" · Ready to merge",
 				" · dave",
+			},
+		},
+		{
+			name: "action users without state text",
+			params: ChannelMessageParams{
+				Owner:  "org",
+				Repo:   "repo",
+				Number: 11,
+				Title:  "Approved PR",
+				Author: "eve",
+				State:  StateApproved, // No state text for approved
+				PRURL:  "https://github.com/org/repo/pull/11",
+				ActionUsers: []ActionUser{
+					{Username: "alice", Mention: "<@1>", Action: "merge"},
+				},
+			},
+			want: []string{
+				EmojiApproved,
+				" · Approved PR",
+				" · eve",
+				" • **merge** → <@1>", // Action users with bullet (no state text)
 			},
 		},
 		{

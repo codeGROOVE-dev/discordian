@@ -87,20 +87,6 @@ func TestSender_ShouldSendReport_RecentlySent(t *testing.T) {
 	}
 }
 
-func TestSender_ShouldSendReport_InvalidTimezone(t *testing.T) {
-	store := newMockStateStore()
-	sender := NewSender(store, nil)
-
-	userInfo := UserBlockingInfo{
-		DiscordUserID: "user123",
-		Timezone:      "Invalid/Timezone",
-		IncomingPRs:   []discord.PRSummary{{Repo: "test", Number: 1}},
-	}
-
-	// Should not panic, should fall back to UTC
-	_ = sender.ShouldSendReport(context.Background(), userInfo)
-}
-
 func TestSender_SendReport(t *testing.T) {
 	store := newMockStateStore()
 	sender := NewSender(store, nil)

@@ -181,6 +181,8 @@ func (h *SlashCommandHandler) handleGooseCommand(
 }
 
 func (h *SlashCommandHandler) handleStatusCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Context is created here because this is a callback from discordgo library
+	// which doesn't provide context in its handler signature
 	ctx := context.Background()
 	guildID := i.GuildID
 
@@ -189,9 +191,9 @@ func (h *SlashCommandHandler) handleStatusCommand(s *discordgo.Session, i *disco
 		status = h.statusGetter.Status(ctx, guildID)
 	}
 
-	connectionValue := "Disconnected"
+	conn := "Disconnected"
 	if status.Connected {
-		connectionValue = "Connected"
+		conn = "Connected"
 	}
 
 	embed := &discordgo.MessageEmbed{
@@ -200,7 +202,7 @@ func (h *SlashCommandHandler) handleStatusCommand(s *discordgo.Session, i *disco
 		Fields: []*discordgo.MessageEmbedField{
 			{
 				Name:   "Connection",
-				Value:  connectionValue,
+				Value:  conn,
 				Inline: true,
 			},
 			{
@@ -252,15 +254,26 @@ func (h *SlashCommandHandler) handleReportCommand(s *discordgo.Session, i *disco
 		},
 	})
 	if err != nil {
-		h.logger.Error("failed to defer response", "error", err)
+		h.logger.Error("failed to defer response",
+			"error", err,
+			"guild_id", i.GuildID,
+			"user_id", i.Member.User.ID,
+			"interaction_id", i.ID,
+			"interaction_token_length", len(i.Token))
 		return
 	}
+
+	h.logger.Debug("deferred response for report command",
+		"guild_id", i.GuildID,
+		"user_id", i.Member.User.ID)
 
 	// Generate report asynchronously
 	go h.generateAndSendReport(s, i)
 }
 
 func (h *SlashCommandHandler) generateAndSendReport(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Context is created here because this is a callback from discordgo library
+	// which doesn't provide context in its handler signature
 	ctx := context.Background()
 	guildID := i.GuildID
 	userID := i.Member.User.ID
@@ -341,15 +354,38 @@ func (*SlashCommandHandler) formatReportEmbed(report *PRReport) *discordgo.Messa
 
 func (h *SlashCommandHandler) handleDashboardCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	userID := i.Member.User.ID
+	guildID := i.GuildID
+
+	// Get user's org info from status getter (includes all orgs for this guild)
+	var orgLinks string
+	if h.statusGetter != nil {
+		// Context is created here because this is a callback from discordgo library
+		// which doesn't provide context in its handler signature
+		ctx := context.Background()
+		status := h.statusGetter.Status(ctx, guildID)
+
+		// For each connected org, show a dashboard link
+		if len(status.ConnectedOrgs) > 0 {
+			orgLinks = "\n\n**Organization Dashboards:**\n"
+			for _, org := range status.ConnectedOrgs {
+				orgLinks += fmt.Sprintf("• %s: [View Dashboard](%s/orgs/%s)\n", org, h.dashboardURL, org)
+			}
+		}
+	}
 
 	dashboardLink := h.dashboardURL
 	if userID != "" {
 		dashboardLink = fmt.Sprintf("%s/?user=%s", h.dashboardURL, userID)
 	}
 
+	description := fmt.Sprintf("View your PRs and configure settings on the web dashboard.\n\n[Open Your Dashboard](%s)", dashboardLink)
+	if orgLinks != "" {
+		description += orgLinks
+	}
+
 	embed := &discordgo.MessageEmbed{
 		Title:       "reviewGOOSE Dashboard",
-		Description: fmt.Sprintf("View your PRs and configure settings on the web dashboard.\n\n[Open Dashboard](%s)", dashboardLink),
+		Description: description,
 		Color:       0x0099ff,
 		Fields: []*discordgo.MessageEmbedField{
 			{
@@ -424,7 +460,12 @@ func (h *SlashCommandHandler) respond(
 		},
 	})
 	if err != nil {
-		h.logger.Error("failed to respond to interaction", "error", err)
+		h.logger.Error("failed to respond to interaction",
+			"error", err,
+			"guild_id", i.GuildID,
+			"user_id", i.Member.User.ID,
+			"interaction_id", i.ID,
+			"interaction_token_length", len(i.Token))
 	}
 }
 
@@ -444,7 +485,11 @@ func (h *SlashCommandHandler) editResponse(
 		Embeds:  &embeds,
 	})
 	if err != nil {
-		h.logger.Error("failed to edit response", "error", err)
+		h.logger.Error("failed to edit response",
+			"error", err,
+			"guild_id", i.GuildID,
+			"user_id", i.Member.User.ID,
+			"interaction_id", i.ID)
 	}
 }
 
