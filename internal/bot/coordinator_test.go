@@ -14,20 +14,33 @@ import (
 // Mock implementations
 
 type mockDiscordClient struct {
-	postedMessages    []postedMessage
-	updatedMessages   []updatedMessage
-	forumThreads      []forumThread
-	sentDMs           []sentDM
-	updatedDMs        []updatedDM
-	channelIDs        map[string]string
-	forumChannels     map[string]bool
-	usersInGuild      map[string]bool
-	activeUsers       map[string]bool
-	botInChannel      map[string]bool
-	channelMessages   map[string]map[string]string // channelID -> messageID -> content
-	guildID           string
-	shouldFailUpdate  bool
+	postedMessages     []postedMessage
+	updatedMessages    []updatedMessage
+	forumThreads       []forumThread
+	sentDMs            []sentDM
+	updatedDMs         []updatedDM
+	channelIDs         map[string]string
+	forumChannels      map[string]bool
+	usersInGuild       map[string]bool
+	activeUsers        map[string]bool
+	botInChannel       map[string]bool
+	channelMessages    map[string]map[string]string // channelID -> messageID -> content
+	existingDMs        map[string]existingDM        // userID:prURL -> DM info
+	archivedThreads    []string
+	foundForumThreads  map[string]foundThread // channelID:prURL -> thread info
+	guildID            string
+	shouldFailUpdate   bool
 	shouldFailUpdateDM bool
+}
+
+type existingDM struct {
+	channelID string
+	messageID string
+}
+
+type foundThread struct {
+	threadID  string
+	messageID string
 }
 
 type postedMessage struct {
@@ -60,13 +73,16 @@ type updatedDM struct {
 
 func newMockDiscordClient() *mockDiscordClient {
 	return &mockDiscordClient{
-		channelIDs:      make(map[string]string),
-		forumChannels:   make(map[string]bool),
-		usersInGuild:    make(map[string]bool),
-		activeUsers:     make(map[string]bool),
-		botInChannel:    make(map[string]bool),
-		channelMessages: make(map[string]map[string]string),
-		guildID:         "test-guild",
+		channelIDs:        make(map[string]string),
+		forumChannels:     make(map[string]bool),
+		usersInGuild:      make(map[string]bool),
+		activeUsers:       make(map[string]bool),
+		botInChannel:      make(map[string]bool),
+		channelMessages:   make(map[string]map[string]string),
+		existingDMs:       make(map[string]existingDM),
+		archivedThreads:   make([]string, 0),
+		foundForumThreads: make(map[string]foundThread),
+		guildID:           "test-guild",
 	}
 }
 
@@ -163,19 +179,44 @@ func (m *mockDiscordClient) MessageContent(_ context.Context, channelID, message
 	return "", fmt.Errorf("message not found")
 }
 
-func (m *mockDiscordClient) FindDMForPR(_ context.Context, _, _ string) (string, string, bool) {
+func (m *mockDiscordClient) FindDMForPR(_ context.Context, userID, prURL string) (string, string, bool) {
+	key := userID + ":" + prURL
+	if dm, exists := m.existingDMs[key]; exists {
+		return dm.channelID, dm.messageID, true
+	}
+	return "", "", false
+}
+
+func (m *mockDiscordClient) UpdateForumPost(_ context.Context, threadID, messageID, title, content string) error {
+	// Track update attempt
+	return nil
+}
+
+func (m *mockDiscordClient) ArchiveThread(_ context.Context, threadID string) error {
+	m.archivedThreads = append(m.archivedThreads, threadID)
+	return nil
+}
+
+func (m *mockDiscordClient) FindForumThread(_ context.Context, channelID, prURL string) (string, string, bool) {
+	key := channelID + ":" + prURL
+	if thread, exists := m.foundForumThreads[key]; exists {
+		return thread.threadID, thread.messageID, true
+	}
 	return "", "", false
 }
 
 type mockConfigManager struct {
-	configs  map[string]*config.DiscordConfig
-	channels map[string][]string // org:repo -> channels
+	configs      map[string]*config.DiscordConfig
+	channels     map[string][]string // org:repo -> channels
+	whenSettings map[string]string   // org:channel -> when value
+	reloadCount  int
 }
 
 func newMockConfigManager() *mockConfigManager {
 	return &mockConfigManager{
-		configs:  make(map[string]*config.DiscordConfig),
-		channels: make(map[string][]string),
+		configs:      make(map[string]*config.DiscordConfig),
+		channels:     make(map[string][]string),
+		whenSettings: make(map[string]string),
 	}
 }
 
@@ -4097,6 +4138,498 @@ func TestCoordinator_processTextChannel_UpdateFailsFallsThrough(t *testing.T) {
 	}
 	if threadInfo.MessageID != "found_msg" {
 		t.Errorf("Message ID = %s, want found_msg (from search fallback)", threadInfo.MessageID)
+	}
+}
+
+// TestCoordinator_processDMForUser_ClaimFailed tests when another instance claims the DM.
+func TestCoordinator_processDMForUser_ClaimFailed(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+	userMapper := newMockUserMapper()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// Set up user mapping
+	userMapper.cache["alice"] = "discord123"
+	discord.usersInGuild["discord123"] = true
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+	}
+
+	// Make ClaimDM fail (another instance claimed it)
+	store.shouldFailClaimDM = true
+
+	// Process DM - should not send since another instance claimed it
+	coord.processDMForUser(ctx, "owner", "repo", 1, checkResp, format.StateNeedsReview, prURL, "alice", "review")
+
+	// Should not have sent any DMs (another instance has it)
+	if len(discord.sentDMs) > 0 {
+		t.Errorf("Should not send DM when another instance claimed it, got %d", len(discord.sentDMs))
+	}
+}
+
+// TestCoordinator_processDMForUser_PendingDMUpdate tests updating a pending DM.
+func TestCoordinator_processDMForUser_PendingDMUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+	userMapper := newMockUserMapper()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// Set up user mapping
+	userMapper.cache["alice"] = "discord123"
+	discord.usersInGuild["discord123"] = true
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+	}
+
+	// Add existing pending DM with different message
+	store.pendingDMs = []*state.PendingDM{
+		{
+			ID:          "pending1",
+			UserID:      "discord123",
+			PRURL:       prURL,
+			MessageText: "old message text",
+			SendAt:      time.Now().Add(1 * time.Hour),
+		},
+	}
+
+	// Process DM with new state - should update pending DM
+	coord.processDMForUser(ctx, "owner", "repo", 1, checkResp, format.StateNeedsReview, prURL, "alice", "review")
+
+	// Old pending DM should be removed (it gets removed and a new one queued)
+	// Since we're testing the removal logic
+	if len(store.pendingDMs) > 1 {
+		t.Errorf("Should have removed old pending DM")
+	}
+}
+
+// TestCoordinator_processDMForUser_FindDMFallback tests finding existing DM from history.
+func TestCoordinator_processDMForUser_FindDMFallback(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+	userMapper := newMockUserMapper()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord:    discord,
+		Config:     configMgr,
+		Store:      store,
+		Turn:       turn,
+		Org:        "testorg",
+		UserMapper: userMapper,
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+
+	// Set up user mapping
+	userMapper.cache["alice"] = "discord123"
+	discord.usersInGuild["discord123"] = true
+
+	// DM exists in Discord history but not in store
+	discord.existingDMs["discord123:"+prURL] = existingDM{
+		channelID: "dm-chan",
+		messageID: "dm-msg",
+	}
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+	}
+
+	// Process DM - should find existing DM and update it
+	coord.processDMForUser(ctx, "owner", "repo", 1, checkResp, format.StateNeedsReview, prURL, "alice", "review")
+
+	// Should have updated existing DM
+	if len(discord.updatedDMs) == 0 {
+		t.Error("Should have updated existing DM found in history")
+	}
+}
+
+// TestCoordinator_processForumChannel_Archive tests archiving merged/closed PRs.
+func TestCoordinator_processForumChannel_Archive(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+	channelID := "forum1"
+
+	params := format.ChannelMessageParams{
+		PRURL:       prURL,
+		Number:      1,
+		State:       format.StateMerged,
+		ChannelName: "test-forum",
+		Title:       "Test PR",
+		Repo:        "repo",
+	}
+
+	// Existing thread with different content
+	existingThread := state.ThreadInfo{
+		ThreadID:    "thread123",
+		MessageID:   "msg123",
+		ChannelID:   channelID,
+		ChannelType: "forum",
+		MessageText: "old content",
+		LastState:   string(format.StateNeedsReview),
+	}
+	_ = store.SaveThread(ctx, "owner", "repo", 1, channelID, existingThread)
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			State:  "closed",
+			Merged: true,
+		},
+	}
+
+	// Process forum channel with merged PR
+	err := coord.processForumChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, existingThread, true)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should have archived the thread
+	if len(discord.archivedThreads) != 1 {
+		t.Errorf("Expected 1 archived thread, got %d", len(discord.archivedThreads))
+	}
+	if discord.archivedThreads[0] != "thread123" {
+		t.Errorf("Archived thread ID = %s, want thread123", discord.archivedThreads[0])
+	}
+}
+
+// TestCoordinator_processForumChannel_ClaimFailed tests cross-instance race.
+func TestCoordinator_processForumChannel_ClaimFailed(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+	channelID := "forum1"
+
+	// Make ClaimThread fail
+	store.claimThreadShouldFail = true
+
+	// Set up found thread from other instance
+	discord.foundForumThreads[channelID+":"+prURL] = foundThread{
+		threadID:  "thread-other",
+		messageID: "msg-other",
+	}
+
+	params := format.ChannelMessageParams{
+		PRURL:       prURL,
+		Number:      1,
+		State:       format.StateNeedsReview,
+		ChannelName: "test-forum",
+		Title:       "Test PR",
+		Repo:        "repo",
+	}
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title: "Test PR",
+			State: "open",
+		},
+	}
+
+	// Process forum channel
+	err := coord.processForumChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should have found and updated thread from other instance
+	threadInfo, exists := store.Store.Thread(ctx, "owner", "repo", 1, channelID)
+	if !exists {
+		t.Error("Thread info should be saved after finding thread")
+	}
+	if threadInfo.ThreadID != "thread-other" {
+		t.Errorf("Thread ID = %s, want thread-other", threadInfo.ThreadID)
+	}
+}
+
+// TestCoordinator_processForumChannel_WhenThreshold tests "when" threshold logic.
+func TestCoordinator_processForumChannel_WhenThreshold(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	// Set "when" to "passing"
+	configMgr.whenSettings["testorg:test-forum"] = "passing"
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	prURL := "https://github.com/owner/repo/pull/1"
+	channelID := "forum1"
+
+	params := format.ChannelMessageParams{
+		PRURL:       prURL,
+		Number:      1,
+		State:       format.StateTestsBroken,
+		ChannelName: "test-forum",
+		Title:       "Test PR",
+		Repo:        "repo",
+	}
+
+	checkResp := &CheckResponse{
+		PullRequest: PRInfo{
+			Title: "Test PR",
+			State: "open",
+		},
+		Analysis: Analysis{
+			Checks: Checks{
+				Failing: 3, // Tests failing
+			},
+		},
+	}
+
+	// Process forum channel - should not create thread yet
+	err := coord.processForumChannel(ctx, channelID, "owner", "repo", 1, params, checkResp, state.ThreadInfo{}, false)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should not have posted (threshold not met)
+	if len(discord.forumThreads) != 0 {
+		t.Errorf("Should not create forum thread when threshold not met, got %d", len(discord.forumThreads))
+	}
+}
+
+// TestCoordinator_processEventSync_ConfigRepo tests skipping .codeGROOVE repo.
+func TestCoordinator_processEventSync_ConfigRepo(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/.codeGROOVE/pull/1",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+		Timestamp:  time.Now(),
+	}
+
+	// Process event
+	err := coord.processEventSync(ctx, event)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should have triggered config reload
+	if configMgr.reloadCount != 1 {
+		t.Errorf("Config reload count = %d, want 1", configMgr.reloadCount)
+	}
+
+	// Should not have posted any messages
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Should not post messages for config repo, got %d", len(discord.postedMessages))
+	}
+}
+
+// TestCoordinator_processEventSync_AlreadyProcessed tests event deduplication.
+func TestCoordinator_processEventSync_AlreadyProcessed(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/repo/pull/1",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+		Timestamp:  time.Now(),
+	}
+
+	// Mark event as already processed
+	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
+	_ = store.MarkProcessed(ctx, eventKey, 5*time.Minute)
+
+	// Process event
+	err := coord.processEventSync(ctx, event)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should not have called Turn API or posted messages
+	if turn.callCount > 0 {
+		t.Errorf("Should not call Turn API for already processed event, got %d calls", turn.callCount)
+	}
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Should not post messages for already processed event, got %d", len(discord.postedMessages))
+	}
+}
+
+// TestCoordinator_processEventSync_NoChannels tests handling when no channels configured.
+func TestCoordinator_processEventSync_NoChannels(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	// Don't configure any channels
+	configMgr.channels = make(map[string][]string)
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	turn.responses["https://github.com/testorg/repo/pull/1"] = &CheckResponse{
+		PullRequest: PRInfo{
+			Title:  "Test PR",
+			Author: "alice",
+			State:  "open",
+		},
+	}
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/repo/pull/1",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+		Timestamp:  time.Now(),
+	}
+
+	// Process event
+	err := coord.processEventSync(ctx, event)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should not have posted any messages (no channels)
+	if len(discord.postedMessages) != 0 {
+		t.Errorf("Should not post when no channels configured, got %d", len(discord.postedMessages))
+	}
+}
+
+// TestCoordinator_processEventSync_TurnAPIFailure tests handling Turn API failures gracefully.
+func TestCoordinator_processEventSync_TurnAPIFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	discord := newMockDiscordClient()
+	turn := newMockTurnClient()
+	configMgr := newMockConfigManager()
+
+	discord.channelIDs["repo"] = "chan-repo"
+	discord.botInChannel["chan-repo"] = true
+	configMgr.channels["testorg:repo"] = []string{"repo"}
+
+	coord := NewCoordinator(CoordinatorConfig{
+		Discord: discord,
+		Config:  configMgr,
+		Store:   store,
+		Turn:    turn,
+		Org:     "testorg",
+	})
+
+	// Make Turn API fail
+	turn.shouldFail = true
+
+	event := SprinklerEvent{
+		URL:        "https://github.com/testorg/repo/pull/1",
+		Type:       "pull_request",
+		DeliveryID: "delivery-1",
+		Timestamp:  time.Now(),
+	}
+
+	// Process event - should handle gracefully and continue
+	err := coord.processEventSync(ctx, event)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Should still mark as processed even though Turn failed
+	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
+	if !store.WasProcessed(ctx, eventKey) {
+		t.Error("Event should be marked as processed even after Turn API failure")
 	}
 }
 
