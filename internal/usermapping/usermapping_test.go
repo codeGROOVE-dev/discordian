@@ -350,3 +350,280 @@ func TestMapper_ConfigUsernameResolution_Mention(t *testing.T) {
 		t.Errorf("Mention with username in config = %q, want %q", got, want)
 	}
 }
+
+// TestMapper_ExportCache tests cache export functionality.
+func TestMapper_ExportCache(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockConfigLookup{
+		users: map[string]string{
+			"alice": "111111111111111111",
+			"bob":   "222222222222222222",
+		},
+	}
+
+	mapper := New("testorg", configLookup, nil)
+
+	// Populate cache
+	mapper.DiscordID(ctx, "alice")
+	mapper.DiscordID(ctx, "bob")
+
+	// Export cache
+	cache := mapper.ExportCache()
+
+	if len(cache) != 2 {
+		t.Errorf("ExportCache returned %d entries, want 2", len(cache))
+	}
+
+	if cache["alice"] != "111111111111111111" {
+		t.Errorf("cache[alice] = %q, want 111111111111111111", cache["alice"])
+	}
+
+	if cache["bob"] != "222222222222222222" {
+		t.Errorf("cache[bob] = %q, want 222222222222222222", cache["bob"])
+	}
+}
+
+// mockOrgConfig implements OrgConfig for testing.
+type mockOrgConfig struct {
+	users map[string]string
+}
+
+func (m *mockOrgConfig) GetUsers() map[string]string {
+	return m.users
+}
+
+// mockReverseConfigLookup implements ReverseConfigLookup for testing.
+type mockReverseConfigLookup struct {
+	orgs map[string]*mockOrgConfig
+}
+
+func (m *mockReverseConfigLookup) Config(org string) (OrgConfig, bool) {
+	cfg, ok := m.orgs[org]
+	return cfg, ok
+}
+
+// TestReverseMapper_GitHubUsername tests reverse mapping from Discord ID to GitHub username.
+func TestReverseMapper_GitHubUsername(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockReverseConfigLookup{
+		orgs: map[string]*mockOrgConfig{
+			"org1": {
+				users: map[string]string{
+					"alice": "111111111111111111",
+					"bob":   "222222222222222222",
+				},
+			},
+			"org2": {
+				users: map[string]string{
+					"charlie": "333333333333333333",
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		discordID string
+		orgs      []string
+		want      string
+	}{
+		{
+			name:      "find user in first org",
+			discordID: "111111111111111111",
+			orgs:      []string{"org1", "org2"},
+			want:      "alice",
+		},
+		{
+			name:      "find user in second org",
+			discordID: "333333333333333333",
+			orgs:      []string{"org1", "org2"},
+			want:      "charlie",
+		},
+		{
+			name:      "user not found",
+			discordID: "999999999999999999",
+			orgs:      []string{"org1", "org2"},
+			want:      "",
+		},
+		{
+			name:      "empty orgs list",
+			discordID: "444444444444444444",
+			orgs:      []string{},
+			want:      "",
+		},
+		{
+			name:      "org not in config",
+			discordID: "555555555555555555",
+			orgs:      []string{"org3"},
+			want:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Use fresh mapper for each test to avoid cache pollution
+			mapper := NewReverseMapper()
+			got := mapper.GitHubUsername(ctx, tt.discordID, configLookup, tt.orgs)
+			if got != tt.want {
+				t.Errorf("GitHubUsername(%q, %v) = %q, want %q", tt.discordID, tt.orgs, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReverseMapper_GitHubUsername_Caching tests that reverse mapping results are cached.
+func TestReverseMapper_GitHubUsername_Caching(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockReverseConfigLookup{
+		orgs: map[string]*mockOrgConfig{
+			"org1": {
+				users: map[string]string{
+					"alice": "111111111111111111",
+				},
+			},
+		},
+	}
+
+	mapper := NewReverseMapper()
+
+	// First call - should hit config
+	username1 := mapper.GitHubUsername(ctx, "111111111111111111", configLookup, []string{"org1"})
+	if username1 != "alice" {
+		t.Errorf("First call: GitHubUsername = %q, want alice", username1)
+	}
+
+	// Change underlying config
+	configLookup.orgs["org1"].users["alice"] = "999999999999999999"
+	configLookup.orgs["org1"].users["bob"] = "111111111111111111"
+
+	// Second call - should return cached value
+	username2 := mapper.GitHubUsername(ctx, "111111111111111111", configLookup, []string{"org1"})
+	if username2 != "alice" {
+		t.Errorf("Cached call: GitHubUsername = %q, want cached alice", username2)
+	}
+}
+
+// TestReverseMapper_GitHubUsername_NilConfigLookup tests handling of nil config lookup.
+func TestReverseMapper_GitHubUsername_NilConfigLookup(t *testing.T) {
+	ctx := context.Background()
+	mapper := NewReverseMapper()
+
+	got := mapper.GitHubUsername(ctx, "111111111111111111", nil, []string{"org1"})
+	if got != "" {
+		t.Errorf("GitHubUsername with nil lookup = %q, want empty", got)
+	}
+}
+
+// TestReverseMapper_ClearCache tests clearing the reverse mapper cache.
+func TestReverseMapper_ClearCache(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockReverseConfigLookup{
+		orgs: map[string]*mockOrgConfig{
+			"org1": {
+				users: map[string]string{
+					"alice": "111111111111111111",
+				},
+			},
+		},
+	}
+
+	mapper := NewReverseMapper()
+
+	// Populate cache
+	mapper.GitHubUsername(ctx, "111111111111111111", configLookup, []string{"org1"})
+
+	// Verify cached
+	if len(mapper.cache) != 1 {
+		t.Errorf("Cache size = %d, want 1", len(mapper.cache))
+	}
+
+	// Clear cache
+	mapper.ClearCache()
+
+	// Verify cleared
+	if len(mapper.cache) != 0 {
+		t.Errorf("After ClearCache, cache size = %d, want 0", len(mapper.cache))
+	}
+}
+
+// TestReverseMapper_ExportCache tests exporting the reverse mapper cache.
+func TestReverseMapper_ExportCache(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockReverseConfigLookup{
+		orgs: map[string]*mockOrgConfig{
+			"org1": {
+				users: map[string]string{
+					"alice": "111111111111111111",
+					"bob":   "222222222222222222",
+				},
+			},
+		},
+	}
+
+	mapper := NewReverseMapper()
+
+	// Populate cache
+	mapper.GitHubUsername(ctx, "111111111111111111", configLookup, []string{"org1"})
+	mapper.GitHubUsername(ctx, "222222222222222222", configLookup, []string{"org1"})
+
+	// Export cache
+	cache := mapper.ExportCache()
+
+	if len(cache) != 2 {
+		t.Errorf("ExportCache returned %d entries, want 2", len(cache))
+	}
+
+	if cache["111111111111111111"] != "alice" {
+		t.Errorf("cache[111111111111111111] = %q, want alice", cache["111111111111111111"])
+	}
+
+	if cache["222222222222222222"] != "bob" {
+		t.Errorf("cache[222222222222222222] = %q, want bob", cache["222222222222222222"])
+	}
+}
+
+// TestReverseMapper_CacheTTL tests that reverse mapper cache entries expire after TTL.
+func TestReverseMapper_CacheTTL(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockReverseConfigLookup{
+		orgs: map[string]*mockOrgConfig{
+			"org1": {
+				users: map[string]string{
+					"alice": "111111111111111111",
+				},
+			},
+		},
+	}
+
+	mapper := NewReverseMapper()
+
+	// First call - populate cache
+	username1 := mapper.GitHubUsername(ctx, "111111111111111111", configLookup, []string{"org1"})
+	if username1 != "alice" {
+		t.Errorf("First call: GitHubUsername = %q, want alice", username1)
+	}
+
+	// Manually expire the cache entry
+	mapper.cacheMu.Lock()
+	if entry, ok := mapper.cache["111111111111111111"]; ok {
+		entry.cachedAt = time.Now().Add(-25 * time.Hour) // Older than 24h TTL
+		mapper.cache["111111111111111111"] = entry
+	}
+	mapper.cacheMu.Unlock()
+
+	// Change underlying config
+	configLookup.orgs["org1"].users["bob"] = "111111111111111111"
+	delete(configLookup.orgs["org1"].users, "alice")
+
+	// After TTL expiry, should get fresh value
+	username2 := mapper.GitHubUsername(ctx, "111111111111111111", configLookup, []string{"org1"})
+	if username2 != "bob" {
+		t.Errorf("After TTL expiry: GitHubUsername = %q, want bob", username2)
+	}
+}

@@ -37,20 +37,31 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-func TestFormatReportEmbed(t *testing.T) {
+func TestFormatDashboardEmbed(t *testing.T) {
 	handler := &SlashCommandHandler{}
 
-	t.Run("empty report", func(t *testing.T) {
-		report := &PRReport{
-			GeneratedAt: "2024-01-15 10:00 UTC",
-		}
-		embed := handler.formatReportEmbed(report)
+	t.Run("empty report with dashboard link", func(t *testing.T) {
+		report := &PRReport{}
+		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		if embed.Title != "Your PR Report" {
-			t.Errorf("Title = %q, want 'Your PR Report'", embed.Title)
+		if embed.Author == nil || embed.Author.Name != "reviewGOOSE" {
+			t.Error("Should have reviewGOOSE author")
 		}
-		if len(embed.Fields) != 0 {
-			t.Errorf("Fields = %d, want 0 for empty report", len(embed.Fields))
+		if embed.Color != 0x57F287 {
+			t.Errorf("Color = %x, want Discord green 0x57F287 (no PRs)", embed.Color)
+		}
+		// Should have dashboard link in Links field
+		hasLinksField := false
+		for _, field := range embed.Fields {
+			if strings.Contains(field.Name, "Links") {
+				hasLinksField = true
+				if !strings.Contains(field.Value, "Personal") {
+					t.Error("Links field should contain Personal dashboard link")
+				}
+			}
+		}
+		if !hasLinksField {
+			t.Error("Should have Links field with dashboard link")
 		}
 	})
 
@@ -58,34 +69,36 @@ func TestFormatReportEmbed(t *testing.T) {
 		report := &PRReport{
 			IncomingPRs: []PRSummary{
 				{
-					Repo:      "myrepo",
-					Number:    42,
-					Title:     "Fix the bug",
-					URL:       "https://github.com/o/myrepo/pull/42",
-					Action:    "needs review",
-					IsBlocked: true,
+					Repo:   "myrepo",
+					Number: 42,
+					Title:  "Fix the bug",
+					Author: "alice",
+					URL:    "https://github.com/o/myrepo/pull/42",
 				},
 			},
-			GeneratedAt: "2024-01-15 10:00 UTC",
 		}
-		embed := handler.formatReportEmbed(report)
+		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		if len(embed.Fields) != 1 {
-			t.Fatalf("Fields = %d, want 1", len(embed.Fields))
+		// Should be yellow when there are PRs to review
+		if embed.Color != 0xFEE75C {
+			t.Errorf("Color = %x, want Discord yellow 0xFEE75C (has PRs)", embed.Color)
 		}
 
-		field := embed.Fields[0]
-		if !strings.Contains(field.Name, "Incoming PRs") {
-			t.Errorf("Field name = %q, want to contain 'Incoming PRs'", field.Name)
+		// Should have Reviewing field
+		hasReviewingField := false
+		for _, field := range embed.Fields {
+			if strings.Contains(field.Name, "Reviewing") {
+				hasReviewingField = true
+				if !strings.Contains(field.Value, "myrepo#42") {
+					t.Errorf("Field value should contain PR reference")
+				}
+				if !strings.Contains(field.Value, "alice") {
+					t.Errorf("Field value should contain author name")
+				}
+			}
 		}
-		if !strings.Contains(field.Value, "🔴") {
-			t.Errorf("Field value should contain blocked indicator 🔴")
-		}
-		if !strings.Contains(field.Value, "myrepo#42") {
-			t.Errorf("Field value should contain PR reference")
-		}
-		if !strings.Contains(field.Value, "needs review") {
-			t.Errorf("Field value should contain action")
+		if !hasReviewingField {
+			t.Error("Should have Reviewing field for incoming PRs")
 		}
 	})
 
@@ -93,45 +106,44 @@ func TestFormatReportEmbed(t *testing.T) {
 		report := &PRReport{
 			OutgoingPRs: []PRSummary{
 				{
-					Repo:      "myrepo",
-					Number:    99,
-					Title:     "New feature",
-					URL:       "https://github.com/o/myrepo/pull/99",
-					Action:    "waiting for review",
-					IsBlocked: true,
+					Repo:   "myrepo",
+					Number: 99,
+					Title:  "New feature",
+					URL:    "https://github.com/o/myrepo/pull/99",
 				},
 			},
-			GeneratedAt: "2024-01-15 10:00 UTC",
 		}
-		embed := handler.formatReportEmbed(report)
+		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		if len(embed.Fields) != 1 {
-			t.Fatalf("Fields = %d, want 1", len(embed.Fields))
+		// Should have Your PRs field
+		hasYourPRsField := false
+		for _, field := range embed.Fields {
+			if strings.Contains(field.Name, "Your PRs") {
+				hasYourPRsField = true
+				if !strings.Contains(field.Value, "myrepo#99") {
+					t.Errorf("Field value should contain PR reference")
+				}
+			}
 		}
-
-		field := embed.Fields[0]
-		if !strings.Contains(field.Name, "Your PRs") {
-			t.Errorf("Field name = %q, want to contain 'Your PRs'", field.Name)
-		}
-		if !strings.Contains(field.Value, "🟢") {
-			t.Errorf("Field value should contain blocked indicator 🟢 for outgoing")
+		if !hasYourPRsField {
+			t.Error("Should have Your PRs field for outgoing PRs")
 		}
 	})
 
 	t.Run("with both sections", func(t *testing.T) {
 		report := &PRReport{
 			IncomingPRs: []PRSummary{
-				{Repo: "repo1", Number: 1, Title: "PR1", URL: "url1"},
+				{Repo: "repo1", Number: 1, Title: "PR1", URL: "url1", Author: "bob"},
 			},
 			OutgoingPRs: []PRSummary{
 				{Repo: "repo2", Number: 2, Title: "PR2", URL: "url2"},
 			},
-			GeneratedAt: "2024-01-15 10:00 UTC",
 		}
-		embed := handler.formatReportEmbed(report)
+		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		if len(embed.Fields) != 2 {
-			t.Fatalf("Fields = %d, want 2", len(embed.Fields))
+		// Should have Reviewing, Your PRs, and Links fields
+		if len(embed.Fields) != 3 {
+			t.Fatalf("Fields = %d, want 3 (Reviewing, Your PRs, Links)", len(embed.Fields))
 		}
 	})
 
@@ -139,13 +151,12 @@ func TestFormatReportEmbed(t *testing.T) {
 		longTitle := strings.Repeat("x", 100)
 		report := &PRReport{
 			IncomingPRs: []PRSummary{
-				{Repo: "repo", Number: 1, Title: longTitle, URL: "url"},
+				{Repo: "repo", Number: 1, Title: longTitle, URL: "url", Author: "charlie"},
 			},
-			GeneratedAt: "2024-01-15 10:00 UTC",
 		}
-		embed := handler.formatReportEmbed(report)
+		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		// Title should be truncated to 40 chars + "..."
+		// Title should be truncated to 50 chars
 		if strings.Contains(embed.Fields[0].Value, longTitle) {
 			t.Error("Long title should be truncated")
 		}
@@ -154,20 +165,23 @@ func TestFormatReportEmbed(t *testing.T) {
 		}
 	})
 
-	t.Run("footer shows generated time", func(t *testing.T) {
-		report := &PRReport{
-			IncomingPRs: []PRSummary{
-				{Repo: "repo", Number: 1, Title: "Test", URL: "url"},
-			},
-			GeneratedAt: "2024-01-15 10:00 UTC",
-		}
-		embed := handler.formatReportEmbed(report)
+	t.Run("includes org links", func(t *testing.T) {
+		report := &PRReport{}
+		orgLinks := "\n\n**Organization Dashboards:**\n• myorg: [View Dashboard](https://example.com/orgs/myorg)\n"
+		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", orgLinks)
 
-		if embed.Footer == nil {
-			t.Fatal("Footer should not be nil")
+		// Should include org links in Links field
+		hasLinksField := false
+		for _, field := range embed.Fields {
+			if strings.Contains(field.Name, "Links") {
+				hasLinksField = true
+				if !strings.Contains(field.Value, "myorg") {
+					t.Error("Links field should include org links")
+				}
+			}
 		}
-		if !strings.Contains(embed.Footer.Text, "2024-01-15") {
-			t.Errorf("Footer = %q, want to contain generated time", embed.Footer.Text)
+		if !hasLinksField {
+			t.Error("Should have Links field with org links")
 		}
 	})
 }

@@ -376,3 +376,175 @@ func TestTracker_DMTime(t *testing.T) {
 		t.Error("LastDMTime() should return zero for different user")
 	}
 }
+
+// TestManager_ProcessPendingDMs_Expired tests that expired DMs are removed.
+func TestManager_ProcessPendingDMs_Expired(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	manager := New(store, nil)
+
+	sender := newMockDMSender()
+	manager.RegisterGuild("guild1", sender)
+
+	// Queue an expired DM
+	dm := &state.PendingDM{
+		ID:          "dm1",
+		UserID:      "user1",
+		GuildID:     "guild1",
+		PRURL:       "https://github.com/o/r/pull/1",
+		MessageText: "Hello",
+		SendAt:      time.Now().Add(-time.Hour),
+		ExpiresAt:   time.Now().Add(-time.Minute), // Expired
+	}
+	store.pendingDMs = append(store.pendingDMs, dm)
+
+	// Process
+	manager.processPendingDMs(ctx)
+
+	// DM should be removed without sending
+	if len(sender.sentDMs) != 0 {
+		t.Error("Expired DM should not be sent")
+	}
+	if len(store.removedDMs) != 1 || store.removedDMs[0] != "dm1" {
+		t.Error("Expired DM should be removed from queue")
+	}
+}
+
+// TestManager_ProcessPendingDMs_MaxRetries tests that DMs exceeding max retries are removed.
+func TestManager_ProcessPendingDMs_MaxRetries(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	manager := New(store, nil)
+
+	sender := newMockDMSender()
+	manager.RegisterGuild("guild1", sender)
+
+	// Queue a DM that has exceeded max retries
+	dm := &state.PendingDM{
+		ID:          "dm1",
+		UserID:      "user1",
+		GuildID:     "guild1",
+		PRURL:       "https://github.com/o/r/pull/1",
+		MessageText: "Hello",
+		SendAt:      time.Now().Add(-time.Hour),
+		RetryCount:  maxRetries, // At max
+	}
+	store.pendingDMs = append(store.pendingDMs, dm)
+
+	// Process
+	manager.processPendingDMs(ctx)
+
+	// DM should be removed without sending
+	if len(sender.sentDMs) != 0 {
+		t.Error("DM with max retries should not be sent")
+	}
+	if len(store.removedDMs) != 1 || store.removedDMs[0] != "dm1" {
+		t.Error("DM with max retries should be removed from queue")
+	}
+}
+
+// TestManager_ProcessPendingDMs_RemoveError tests handling of remove errors.
+func TestManager_ProcessPendingDMs_RemoveError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	store.removeErr = errors.New("remove failed")
+	manager := New(store, nil)
+
+	sender := newMockDMSender()
+	manager.RegisterGuild("guild1", sender)
+
+	// Queue a DM
+	dm := &state.PendingDM{
+		ID:          "dm1",
+		UserID:      "user1",
+		GuildID:     "guild1",
+		PRURL:       "https://github.com/o/r/pull/1",
+		MessageText: "Hello",
+		SendAt:      time.Now().Add(-time.Hour),
+	}
+	store.pendingDMs = append(store.pendingDMs, dm)
+
+	// Process - should not panic
+	manager.processPendingDMs(ctx)
+
+	// DM should have been sent despite remove error
+	if len(sender.sentDMs) != 1 {
+		t.Error("DM should be sent even if removal fails")
+	}
+}
+
+// TestManager_ProcessPendingDMs_SaveDMInfoError tests handling of SaveDMInfo errors.
+func TestManager_ProcessPendingDMs_SaveDMInfoError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	store.saveDMErr = errors.New("save failed")
+	manager := New(store, nil)
+
+	sender := newMockDMSender()
+	manager.RegisterGuild("guild1", sender)
+
+	// Queue a DM
+	dm := &state.PendingDM{
+		ID:          "dm1",
+		UserID:      "user1",
+		GuildID:     "guild1",
+		PRURL:       "https://github.com/o/r/pull/1",
+		MessageText: "Hello",
+		SendAt:      time.Now().Add(-time.Hour),
+	}
+	store.pendingDMs = append(store.pendingDMs, dm)
+
+	// Process - should not panic
+	manager.processPendingDMs(ctx)
+
+	// DM should have been sent despite save error
+	if len(sender.sentDMs) != 1 {
+		t.Error("DM should be sent even if SaveDMInfo fails")
+	}
+	// DM should still be removed
+	if len(store.removedDMs) != 1 {
+		t.Error("DM should be removed even if SaveDMInfo fails")
+	}
+}
+
+// TestManager_ProcessPendingDMs_RetryScheduling tests exponential backoff retry scheduling.
+func TestManager_ProcessPendingDMs_RetryScheduling(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	manager := New(store, nil)
+
+	sender := newMockDMSender()
+	sender.sendErr = errors.New("temporary error")
+	manager.RegisterGuild("guild1", sender)
+
+	// Queue a DM with retry count
+	dm := &state.PendingDM{
+		ID:          "dm1",
+		UserID:      "user1",
+		GuildID:     "guild1",
+		PRURL:       "https://github.com/o/r/pull/1",
+		MessageText: "Hello",
+		SendAt:      time.Now().Add(-time.Hour),
+		RetryCount:  2, // Third attempt
+	}
+	store.pendingDMs = append(store.pendingDMs, dm)
+
+	before := time.Now()
+	manager.processPendingDMs(ctx)
+	after := time.Now()
+
+	// DM should have been retried
+	if len(store.pendingDMs) == 0 {
+		t.Fatal("DM should remain in queue for retry")
+	}
+
+	retried := store.pendingDMs[0]
+	if retried.RetryCount != 3 {
+		t.Errorf("RetryCount = %d, want 3", retried.RetryCount)
+	}
+
+	// SendAt should be in the future (exponential backoff)
+	if retried.SendAt.Before(before) || retried.SendAt.Before(after) {
+		t.Error("SendAt should be scheduled in the future")
+	}
+}

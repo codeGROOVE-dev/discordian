@@ -76,24 +76,29 @@ func (m *Mapper) DiscordID(ctx context.Context, githubUsername string) string {
 			if isNumericID(configValue) {
 				// It's a numeric ID, use it directly
 				m.cacheResult(githubUsername, configValue)
-				slog.Debug("mapped user via config (numeric ID)",
-					"github", githubUsername,
-					"discord_id", configValue)
+				slog.Info("mapped GitHub user to Discord via config (numeric ID)",
+					"github_username", githubUsername,
+					"discord_id", configValue,
+					"org", m.org,
+					"method", "config_numeric_id")
 				return configValue
 			}
 			// It's a Discord username, resolve it to numeric ID
 			if m.discordLookup != nil {
 				if id := m.discordLookup.LookupUserByUsername(ctx, configValue); id != "" {
 					m.cacheResult(githubUsername, id)
-					slog.Debug("mapped user via config (username resolved)",
-						"github", githubUsername,
+					slog.Info("mapped GitHub user to Discord via config (username resolved)",
+						"github_username", githubUsername,
 						"discord_username", configValue,
-						"discord_id", id)
+						"discord_id", id,
+						"org", m.org,
+						"method", "config_username_resolved")
 					return id
 				}
 				slog.Warn("config specified Discord username not found in guild",
-					"github", githubUsername,
-					"discord_username", configValue)
+					"github_username", githubUsername,
+					"discord_username", configValue,
+					"org", m.org)
 			}
 		}
 	}
@@ -102,16 +107,20 @@ func (m *Mapper) DiscordID(ctx context.Context, githubUsername string) string {
 	if m.discordLookup != nil {
 		if id := m.discordLookup.LookupUserByUsername(ctx, githubUsername); id != "" {
 			m.cacheResult(githubUsername, id)
-			slog.Debug("mapped user via Discord lookup",
-				"github", githubUsername,
-				"discord_id", id)
+			slog.Info("mapped GitHub user to Discord via username match",
+				"github_username", githubUsername,
+				"discord_id", id,
+				"org", m.org,
+				"method", "discord_username_match")
 			return id
 		}
 	}
 
 	// Tier 3: No mapping found
-	slog.Debug("no Discord mapping found",
-		"github", githubUsername)
+	slog.Info("no Discord mapping found for GitHub user",
+		"github_username", githubUsername,
+		"org", m.org,
+		"note", "user will not receive notifications")
 	return ""
 }
 
@@ -152,4 +161,16 @@ func (m *Mapper) ClearCache() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cache = make(map[string]cacheEntry)
+}
+
+// ExportCache returns a copy of the cache for inspection (githubUsername -> discordID).
+func (m *Mapper) ExportCache() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string]string, len(m.cache))
+	for githubUsername, entry := range m.cache {
+		result[githubUsername] = entry.discordID
+	}
+	return result
 }

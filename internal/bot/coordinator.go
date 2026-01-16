@@ -11,6 +11,7 @@ import (
 	"github.com/codeGROOVE-dev/discordian/internal/discord"
 	"github.com/codeGROOVE-dev/discordian/internal/format"
 	"github.com/codeGROOVE-dev/discordian/internal/state"
+	"github.com/codeGROOVE-dev/discordian/internal/usermapping"
 	"github.com/google/uuid"
 )
 
@@ -269,6 +270,81 @@ func (c *Coordinator) buildActionUsers(ctx context.Context, checkResp *CheckResp
 	return users
 }
 
+// shouldPostThread determines if a PR thread should be posted based on configured threshold.
+// Returns (shouldPost bool, reason string).
+func (c *Coordinator) shouldPostThread(checkResult *CheckResponse, when string) (bool, string) {
+	if checkResult == nil {
+		return false, "no_check_result"
+	}
+
+	pr := checkResult.PullRequest
+	analysis := checkResult.Analysis
+
+	// Terminal states ALWAYS post (ensure visibility)
+	if pr.Merged {
+		return true, "pr_merged"
+	}
+	if pr.State == "closed" {
+		return true, "pr_closed"
+	}
+
+	switch when {
+	case "immediate":
+		return true, "immediate_mode"
+
+	case "assigned":
+		// Post when PR has assignees
+		if len(pr.Assignees) > 0 {
+			return true, fmt.Sprintf("has_%d_assignees", len(pr.Assignees))
+		}
+		return false, "no_assignees"
+
+	case "blocked":
+		// Post when someone needs to take action
+		// Count real users in NextAction (excluding _system sentinel)
+		blockedCount := 0
+		for username := range analysis.NextAction {
+			if username != "_system" {
+				blockedCount++
+			}
+		}
+		if blockedCount > 0 {
+			return true, fmt.Sprintf("blocked_on_%d_users", blockedCount)
+		}
+		return false, "not_blocked_yet"
+
+	case "passing":
+		// Post when tests pass - use WorkflowState as primary signal
+		switch analysis.WorkflowState {
+		case "assigned_waiting_for_review",
+			"reviewed_needs_refinement",
+			"refined_waiting_for_approval",
+			"approved_waiting_for_merge":
+			return true, fmt.Sprintf("workflow_state_%s", analysis.WorkflowState)
+
+		case "newly_published",
+			"in_draft",
+			"published_waiting_for_tests",
+			"tested_waiting_for_assignment":
+			return false, fmt.Sprintf("waiting_for_%s", analysis.WorkflowState)
+
+		default:
+			// Fallback: check test status directly
+			if analysis.Checks.Failing > 0 {
+				return false, "tests_failing"
+			}
+			if analysis.Checks.Pending > 0 || analysis.Checks.Waiting > 0 {
+				return false, "tests_pending"
+			}
+			return true, "tests_passed_fallback"
+		}
+
+	default:
+		c.logger.Warn("invalid when value, defaulting to immediate", "when", when)
+		return true, "invalid_config_default_immediate"
+	}
+}
+
 func (c *Coordinator) processChannel(
 	ctx context.Context,
 	channelName string,
@@ -332,10 +408,10 @@ func (c *Coordinator) processChannel(
 
 	// Auto-detect forum channels from Discord API
 	if c.discord.IsForumChannel(ctx, channelID) {
-		return c.processForumChannel(ctx, channelID, owner, repo, number, params, threadInfo, exists)
+		return c.processForumChannel(ctx, channelID, owner, repo, number, params, checkResp, threadInfo, exists)
 	}
 
-	return c.processTextChannel(ctx, channelID, owner, repo, number, params, threadInfo, exists)
+	return c.processTextChannel(ctx, channelID, owner, repo, number, params, checkResp, threadInfo, exists)
 }
 
 func (c *Coordinator) processForumChannel(
@@ -344,6 +420,7 @@ func (c *Coordinator) processForumChannel(
 	owner, repo string,
 	number int,
 	params format.ChannelMessageParams,
+	checkResp *CheckResponse,
 	threadInfo state.ThreadInfo,
 	exists bool,
 ) error {
@@ -381,6 +458,27 @@ func (c *Coordinator) processForumChannel(
 			return nil
 		}
 		c.logger.Warn("failed to update forum post, will search/create", "error", err)
+	}
+
+	// Thread doesn't exist - check if we should create it based on "when" threshold
+	when := c.config.When(owner, params.ChannelName)
+	if when != "immediate" {
+		shouldPost, reason := c.shouldPostThread(checkResp, when)
+
+		if !shouldPost {
+			c.logger.Debug("not creating forum thread - threshold not met",
+				"pr", params.PRURL,
+				"channel", params.ChannelName,
+				"when", when,
+				"reason", reason)
+			return nil // Don't create thread yet - next event will check again
+		}
+
+		c.logger.Info("creating forum thread - threshold met",
+			"pr", params.PRURL,
+			"channel", params.ChannelName,
+			"when", when,
+			"reason", reason)
 	}
 
 	// Try to claim this thread creation
@@ -485,6 +583,7 @@ func (c *Coordinator) processTextChannel(
 	owner, repo string,
 	number int,
 	params format.ChannelMessageParams,
+	checkResp *CheckResponse,
 	threadInfo state.ThreadInfo,
 	exists bool,
 ) error {
@@ -525,6 +624,27 @@ func (c *Coordinator) processTextChannel(
 			"pr", params.PRURL,
 			"exists", exists,
 			"has_message_id", exists && threadInfo.MessageID != "")
+	}
+
+	// Message doesn't exist - check if we should create it based on "when" threshold
+	when := c.config.When(owner, params.ChannelName)
+	if when != "immediate" {
+		shouldPost, reason := c.shouldPostThread(checkResp, when)
+
+		if !shouldPost {
+			c.logger.Debug("not creating channel message - threshold not met",
+				"pr", params.PRURL,
+				"channel", params.ChannelName,
+				"when", when,
+				"reason", reason)
+			return nil // Don't create message yet - next event will check again
+		}
+
+		c.logger.Info("creating channel message - threshold met",
+			"pr", params.PRURL,
+			"channel", params.ChannelName,
+			"when", when,
+			"reason", reason)
 	}
 
 	// Try to claim this thread creation
@@ -1031,6 +1151,15 @@ func (c *Coordinator) CleanupLocks() {
 			"pr_locks_removed", prRemoved,
 			"dm_locks_removed", dmRemoved)
 	}
+}
+
+// ExportUserMapperCache returns the cached user mappings (githubUsername -> discordID).
+// Returns empty map if the user mapper doesn't support cache export.
+func (c *Coordinator) ExportUserMapperCache() map[string]string {
+	if mapper, ok := c.userMapper.(*usermapping.Mapper); ok {
+		return mapper.ExportCache()
+	}
+	return make(map[string]string)
 }
 
 // tagTracker tracks which users were tagged in channel messages.

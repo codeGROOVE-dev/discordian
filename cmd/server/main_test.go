@@ -9,6 +9,7 @@ import (
 	"github.com/codeGROOVE-dev/discordian/internal/config"
 	"github.com/codeGROOVE-dev/discordian/internal/discord"
 	"github.com/codeGROOVE-dev/discordian/internal/state"
+	"github.com/codeGROOVE-dev/discordian/internal/usermapping"
 )
 
 // Mock implementations for testing
@@ -105,6 +106,7 @@ func TestCoordinatorManager_Status(t *testing.T) {
 			startTime:      time.Now().Add(-1 * time.Hour),
 			store:          &mockStateStore{},
 			configManager:  config.New(),
+			reverseMapper:  usermapping.NewReverseMapper(),
 		}
 
 		status := cm.Status(context.Background(), "test-guild")
@@ -138,6 +140,7 @@ func TestCoordinatorManager_Status(t *testing.T) {
 			startTime:      time.Now(),
 			store:          mockStore,
 			configManager:  config.New(),
+			reverseMapper:  usermapping.NewReverseMapper(),
 		}
 
 		status := cm.Status(context.Background(), "test-guild")

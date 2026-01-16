@@ -143,7 +143,8 @@ func run(ctx context.Context, cancel context.CancelFunc) int {
 	eg.Go(func() error {
 		<-ctx.Done()
 		slog.Info("shutting down HTTP server")
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		// Fast shutdown for quick handoff during deployments (250ms)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 250*time.Millisecond)
 		defer shutdownCancel()
 		return server.Shutdown(shutdownCtx)
 	})
@@ -198,6 +199,9 @@ type coordinatorManager struct {
 	coordinators   map[string]*bot.Coordinator             // org -> coordinator
 	startTime      time.Time
 	lastEventTime  map[string]time.Time // org -> last event time
+	dmsSent        int64                // Total DMs sent since start
+	dailyReports   int64                // Total daily reports sent since start
+	channelMsgs    int64                // Total channel messages sent since start
 	mu             sync.Mutex
 }
 
@@ -448,6 +452,7 @@ func (cm *coordinatorManager) startSingleCoordinator(ctx context.Context, org st
 }
 
 func (cm *coordinatorManager) discordClientForGuild(_ context.Context, guildID string) (*discord.Client, error) {
+	// Check if client already exists (caller must hold cm.mu lock)
 	if client, exists := cm.discordClients[guildID]; exists {
 		return client, nil
 	}
@@ -470,9 +475,11 @@ func (cm *coordinatorManager) discordClientForGuild(_ context.Context, guildID s
 	slashHandler := discord.NewSlashCommandHandler(client.Session(), slog.Default())
 	slashHandler.SetupHandler()
 
-	// Set status and report getters
+	// Set status, report, usermap, and channel map getters
 	slashHandler.SetStatusGetter(cm)
 	slashHandler.SetReportGetter(cm)
+	slashHandler.SetUserMapGetter(cm)
+	slashHandler.SetChannelMapGetter(cm)
 
 	// Register slash commands with Discord
 	if err := slashHandler.RegisterCommands(guildID); err != nil {
@@ -522,6 +529,7 @@ func (cm *coordinatorManager) shutdown() error {
 		}
 	}
 
+	slog.Info("all coordinators stopped")
 	return nil
 }
 
@@ -531,9 +539,13 @@ func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discor
 	defer cm.mu.Unlock()
 
 	status := discord.BotStatus{
-		Connected:     len(cm.active) > 0,
-		ConnectedOrgs: make([]string, 0, len(cm.active)),
-		UptimeSeconds: int64(time.Since(cm.startTime).Seconds()),
+		Connected:            len(cm.active) > 0,
+		ConnectedOrgs:        make([]string, 0, len(cm.active)),
+		UptimeSeconds:        int64(time.Since(cm.startTime).Seconds()),
+		SprinklerConnections: len(cm.active), // Each active org has a sprinkler connection
+		DMsSent:              cm.dmsSent,
+		DailyReportsSent:     cm.dailyReports,
+		ChannelMessagesSent:  cm.channelMsgs,
 	}
 
 	// Find all orgs for this guild (a guild may monitor multiple orgs)
@@ -544,6 +556,16 @@ func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discor
 		cfg, exists := cm.configManager.Config(org)
 		if exists && cfg.Global.GuildID == guildID {
 			orgsForGuild = append(orgsForGuild, org)
+		}
+	}
+
+	// Count cached users from both forward and reverse mappers
+	if cm.reverseMapper != nil {
+		status.UsersCached = len(cm.reverseMapper.ExportCache())
+	}
+	for _, org := range orgsForGuild {
+		if coord, exists := cm.coordinators[org]; exists {
+			status.UsersCached += len(coord.ExportUserMapperCache())
 		}
 	}
 
@@ -581,6 +603,10 @@ func (cm *coordinatorManager) Status(ctx context.Context, guildID string) discor
 
 // Report implements discord.ReportGetter interface.
 func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string) (*discord.PRReport, error) {
+	slog.Info("report requested",
+		"guild_id", guildID,
+		"user_id", userID)
+
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -595,6 +621,12 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		}
 	}
 
+	slog.Info("found orgs for guild",
+		"guild_id", guildID,
+		"user_id", userID,
+		"orgs_for_guild", orgsForGuild,
+		"all_active_orgs", allOrgs)
+
 	if len(orgsForGuild) == 0 {
 		slog.Error("no org found for guild - report generation failed",
 			"guild_id", guildID,
@@ -604,14 +636,46 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		return nil, fmt.Errorf("no org found for guild %s", guildID)
 	}
 
-	slog.Debug("generating report",
+	slog.Info("looking up GitHub username for Discord user",
 		"guild_id", guildID,
 		"user_id", userID,
 		"orgs", orgsForGuild,
 		"org_count", len(orgsForGuild))
 
-	// Use reverse mapper to find GitHub username from Discord user ID
-	githubUsername := cm.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{cm.configManager}, orgsForGuild)
+	// First try forward mapper caches (these contain discovered/cached mappings)
+	var githubUsername string
+	for _, org := range orgsForGuild {
+		coord, exists := cm.coordinators[org]
+		if !exists {
+			continue
+		}
+		forwardCache := coord.ExportUserMapperCache()
+		slog.Debug("checking forward mapper cache for reverse lookup",
+			"org", org,
+			"discord_user_id", userID,
+			"cache_size", len(forwardCache))
+		for ghUser, discordID := range forwardCache {
+			if discordID == userID {
+				githubUsername = ghUser
+				slog.Info("found GitHub username via forward mapper cache",
+					"discord_user_id", userID,
+					"github_username", githubUsername,
+					"org", org)
+				break
+			}
+		}
+		if githubUsername != "" {
+			break
+		}
+	}
+
+	// If not found in forward caches, try reverse mapper (checks config only)
+	if githubUsername == "" {
+		slog.Debug("GitHub username not found in forward mapper caches, trying reverse mapper",
+			"discord_user_id", userID)
+		githubUsername = cm.reverseMapper.GitHubUsername(ctx, userID, &configAdapter{cm.configManager}, orgsForGuild)
+	}
+
 	if githubUsername == "" {
 		slog.Warn("no GitHub username mapping found for Discord user - add to config.yaml users section",
 			"guild_id", guildID,
@@ -633,10 +697,18 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 	searcher := github.NewSearcher(cm.githubManager.AppClient(), slog.Default())
 
 	for _, org := range orgsForGuild {
+		slog.Info("searching PRs for org",
+			"org", org,
+			"github_username", githubUsername,
+			"guild_id", guildID)
+
 		// Get GitHub client for this org
 		client, exists := cm.githubManager.ClientForOrg(org)
 		if !exists {
-			slog.Warn("no GitHub client for org, skipping", "org", org)
+			slog.Warn("no GitHub client for org, skipping",
+				"org", org,
+				"github_username", githubUsername,
+				"guild_id", guildID)
 			continue
 		}
 
@@ -644,6 +716,9 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		turn := bot.NewTurnClient(cm.cfg.TurnURL, client)
 
 		// Search for PRs authored by this user (outgoing)
+		slog.Info("searching authored PRs",
+			"org", org,
+			"github_username", githubUsername)
 		authored, err := searcher.ListAuthoredPRs(ctx, org, githubUsername)
 		if err != nil {
 			slog.Warn("failed to search authored PRs", "org", org, "error", err)
@@ -662,6 +737,9 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		}
 
 		// Search for PRs where user is requested to review (incoming)
+		slog.Info("searching review-requested PRs",
+			"org", org,
+			"github_username", githubUsername)
 		review, err := searcher.ListReviewRequestedPRs(ctx, org, githubUsername)
 		if err != nil {
 			slog.Warn("failed to search review-requested PRs", "org", org, "error", err)
@@ -691,6 +769,227 @@ func (cm *coordinatorManager) Report(ctx context.Context, guildID, userID string
 		IncomingPRs: incomingPRs,
 		OutgoingPRs: outgoingPRs,
 		GeneratedAt: time.Now().Format(time.RFC3339),
+	}, nil
+}
+
+// UserMappings implements discord.UserMapGetter interface.
+func (cm *coordinatorManager) UserMappings(ctx context.Context, guildID string) (*discord.UserMappings, error) {
+	slog.Info("user mappings requested",
+		"guild_id", guildID)
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Find all orgs for this guild
+	var orgsForGuild []string
+	for org := range cm.active {
+		cfg, exists := cm.configManager.Config(org)
+		if exists && cfg.Global.GuildID == guildID {
+			orgsForGuild = append(orgsForGuild, org)
+		}
+	}
+
+	if len(orgsForGuild) == 0 {
+		slog.Warn("no org found for guild when retrieving user mappings",
+			"guild_id", guildID)
+		return &discord.UserMappings{}, nil
+	}
+
+	slog.Info("found orgs for guild when retrieving user mappings",
+		"guild_id", guildID,
+		"orgs", orgsForGuild)
+
+	var configMappings []discord.UserMapping
+	var discoveredMappings []discord.UserMapping
+	seen := make(map[string]bool) // Track seen GitHub usernames to avoid duplicates
+
+	// Collect config mappings from each org
+	for _, org := range orgsForGuild {
+		cfg, exists := cm.configManager.Config(org)
+		if !exists {
+			continue
+		}
+
+		// Get the users map from config (githubUsername -> discordID)
+		users := cfg.GetUsers()
+		slog.Debug("collecting config user mappings",
+			"org", org,
+			"user_count", len(users))
+		for githubUsername, discordID := range users {
+			slog.Debug("found config user mapping",
+				"org", org,
+				"github_username", githubUsername,
+				"discord_id", discordID)
+			key := fmt.Sprintf("%s:%s", org, githubUsername)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			configMappings = append(configMappings, discord.UserMapping{
+				GitHubUsername: githubUsername,
+				DiscordUserID:  discordID,
+				Source:         "config",
+				Org:            org,
+			})
+		}
+	}
+
+	// Collect cached mappings from reverse mapper (Discord -> GitHub)
+	reverseCache := cm.reverseMapper.ExportCache()
+	for discordID, githubUsername := range reverseCache {
+		// Check if this is already in config mappings
+		found := false
+		for i := range configMappings {
+			if configMappings[i].GitHubUsername == githubUsername && configMappings[i].DiscordUserID == discordID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			discoveredMappings = append(discoveredMappings, discord.UserMapping{
+				GitHubUsername: githubUsername,
+				DiscordUserID:  discordID,
+				Source:         "cached",
+				Org:            "", // Reverse cache doesn't track org
+			})
+		}
+	}
+
+	// Collect cached mappings from each org's forward mapper (GitHub -> Discord)
+	for _, org := range orgsForGuild {
+		coord, exists := cm.coordinators[org]
+		if !exists {
+			continue
+		}
+
+		// Get cached forward mappings
+		forwardCache := coord.ExportUserMapperCache()
+		slog.Debug("collecting forward mapper cache",
+			"org", org,
+			"cached_user_count", len(forwardCache))
+		for githubUsername, discordID := range forwardCache {
+			slog.Debug("found forward mapper cached mapping",
+				"org", org,
+				"github_username", githubUsername,
+				"discord_id", discordID)
+			// Check if already in config or discovered
+			found := false
+			for i := range configMappings {
+				if configMappings[i].GitHubUsername == githubUsername && configMappings[i].DiscordUserID == discordID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				for i := range discoveredMappings {
+					if discoveredMappings[i].GitHubUsername == githubUsername && discoveredMappings[i].DiscordUserID == discordID {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				discoveredMappings = append(discoveredMappings, discord.UserMapping{
+					GitHubUsername: githubUsername,
+					DiscordUserID:  discordID,
+					Source:         "username_match",
+					Org:            org,
+				})
+			}
+		}
+	}
+
+	totalUsers := len(configMappings) + len(discoveredMappings)
+
+	slog.Info("user mappings retrieved",
+		"guild_id", guildID,
+		"config_mappings", len(configMappings),
+		"discovered_mappings", len(discoveredMappings),
+		"total_users", totalUsers)
+
+	return &discord.UserMappings{
+		ConfigMappings:     configMappings,
+		DiscoveredMappings: discoveredMappings,
+		TotalUsers:         totalUsers,
+	}, nil
+}
+
+// ChannelMappings implements discord.ChannelMapGetter interface.
+func (cm *coordinatorManager) ChannelMappings(ctx context.Context, guildID string) (*discord.ChannelMappings, error) {
+	slog.Info("channel mappings requested",
+		"guild_id", guildID)
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Find all orgs for this guild
+	var orgsForGuild []string
+	for org := range cm.active {
+		cfg, exists := cm.configManager.Config(org)
+		if exists && cfg.Global.GuildID == guildID {
+			orgsForGuild = append(orgsForGuild, org)
+		}
+	}
+
+	if len(orgsForGuild) == 0 {
+		slog.Warn("no org found for guild when retrieving channel mappings",
+			"guild_id", guildID)
+		return &discord.ChannelMappings{}, nil
+	}
+
+	slog.Info("found orgs for guild when retrieving channel mappings",
+		"guild_id", guildID,
+		"orgs", orgsForGuild)
+
+	var repoMappings []discord.RepoChannelMapping
+	seenRepos := make(map[string]bool) // Track seen repos to avoid duplicates
+
+	// Collect channel mappings from each org's config
+	for _, org := range orgsForGuild {
+		cfg, exists := cm.configManager.Config(org)
+		if !exists {
+			continue
+		}
+
+		// Build reverse map: repo -> channels
+		repoChannels := make(map[string][]string)
+		repoChannelTypes := make(map[string][]string)
+
+		for channelName, channelConfig := range cfg.Channels {
+			channelType := cm.configManager.ChannelType(org, channelName)
+			for _, repo := range channelConfig.Repos {
+				fullRepo := fmt.Sprintf("%s/%s", org, repo)
+				repoChannels[fullRepo] = append(repoChannels[fullRepo], channelName)
+				repoChannelTypes[fullRepo] = append(repoChannelTypes[fullRepo], channelType)
+			}
+		}
+
+		// Convert to RepoChannelMapping structs
+		for repo, channels := range repoChannels {
+			if seenRepos[repo] {
+				continue
+			}
+			seenRepos[repo] = true
+
+			repoMappings = append(repoMappings, discord.RepoChannelMapping{
+				Repo:         repo,
+				Channels:     channels,
+				ChannelTypes: repoChannelTypes[repo],
+				Org:          org,
+			})
+		}
+	}
+
+	totalRepos := len(repoMappings)
+
+	slog.Info("channel mappings retrieved",
+		"guild_id", guildID,
+		"total_repos", totalRepos)
+
+	return &discord.ChannelMappings{
+		RepoMappings: repoMappings,
+		TotalRepos:   totalRepos,
 	}, nil
 }
 
