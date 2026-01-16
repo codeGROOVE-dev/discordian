@@ -2,11 +2,13 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/codeGROOVE-dev/discordian/internal/bot"
+	"github.com/codeGROOVE-dev/retry"
 	"github.com/google/go-github/v50/github"
 )
 
@@ -63,6 +65,40 @@ func (s *Searcher) ListClosedPRs(ctx context.Context, org string, closedWithinHo
 	return s.searchPRs(ctx, client, query)
 }
 
+// ListAuthoredPRs returns open PRs authored by a specific user.
+func (s *Searcher) ListAuthoredPRs(ctx context.Context, org, githubUsername string) ([]bot.PRSearchResult, error) {
+	client, err := s.appClient.ClientForOrg(ctx, org)
+	if err != nil {
+		return nil, fmt.Errorf("get client for org: %w", err)
+	}
+
+	query := fmt.Sprintf("is:pr is:open author:%s org:%s", githubUsername, org)
+
+	s.logger.Info("searching for authored PRs",
+		"github_user", githubUsername,
+		"org", org,
+		"query", query)
+
+	return s.searchPRs(ctx, client, query)
+}
+
+// ListReviewRequestedPRs returns open PRs where a specific user is requested to review.
+func (s *Searcher) ListReviewRequestedPRs(ctx context.Context, org, githubUsername string) ([]bot.PRSearchResult, error) {
+	client, err := s.appClient.ClientForOrg(ctx, org)
+	if err != nil {
+		return nil, fmt.Errorf("get client for org: %w", err)
+	}
+
+	query := fmt.Sprintf("is:pr is:open review-requested:%s org:%s", githubUsername, org)
+
+	s.logger.Info("searching for review-requested PRs",
+		"github_user", githubUsername,
+		"org", org,
+		"query", query)
+
+	return s.searchPRs(ctx, client, query)
+}
+
 func (s *Searcher) searchPRs(ctx context.Context, client *github.Client, query string) ([]bot.PRSearchResult, error) {
 	opts := &github.SearchOptions{
 		Sort:  "updated",
@@ -75,9 +111,35 @@ func (s *Searcher) searchPRs(ctx context.Context, client *github.Client, query s
 	var results []bot.PRSearchResult
 
 	for {
-		result, resp, err := client.Search.Issues(ctx, query, opts)
+		var result *github.IssuesSearchResult
+		var resp *github.Response
+
+		// GitHub Search API with retry logic
+		err := retry.Do(
+			func() error {
+				var err error
+				result, resp, err = client.Search.Issues(ctx, query, opts)
+				return err
+			},
+			retry.Context(ctx),
+			retry.Attempts(5),
+			retry.Delay(time.Second),
+			retry.MaxDelay(2*time.Minute),
+			retry.DelayType(retry.BackOffDelay),
+			retry.LastErrorOnly(true),
+			retry.OnRetry(func(n uint, err error) {
+				s.logger.Warn("GitHub search API failed, retrying",
+					"query", query,
+					"attempt", n+1,
+					"error", err)
+			}),
+			retry.RetryIf(func(err error) bool {
+				// Don't retry on context cancellation
+				return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+			}),
+		)
 		if err != nil {
-			s.logger.Error("GitHub search API failed",
+			s.logger.Error("GitHub search API failed after retries",
 				"query", query,
 				"error", err)
 			return nil, fmt.Errorf("search issues: %w", err)

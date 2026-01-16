@@ -160,11 +160,19 @@ func (h *SlashCommandHandler) handleGooseCommand(
 	data discordgo.ApplicationCommandInteractionData,
 ) {
 	if len(data.Options) == 0 {
+		h.logger.Warn("goose command called without subcommand",
+			"guild_id", i.GuildID,
+			"user_id", i.Member.User.ID)
 		h.respondError(s, i, "Please specify a subcommand: /goose status, /goose report, /goose dashboard, or /goose help")
 		return
 	}
 
 	subcommand := data.Options[0].Name
+
+	h.logger.Info("processing goose command",
+		"guild_id", i.GuildID,
+		"user_id", i.Member.User.ID,
+		"subcommand", subcommand)
 
 	switch subcommand {
 	case "status":
@@ -186,10 +194,21 @@ func (h *SlashCommandHandler) handleStatusCommand(s *discordgo.Session, i *disco
 	ctx := context.Background()
 	guildID := i.GuildID
 
+	h.logger.Info("handling status command",
+		"guild_id", guildID,
+		"user_id", i.Member.User.ID)
+
 	var status BotStatus
 	if h.statusGetter != nil {
 		status = h.statusGetter.Status(ctx, guildID)
 	}
+
+	h.logger.Info("returning status",
+		"guild_id", guildID,
+		"connected", status.Connected,
+		"active_prs", status.ActivePRs,
+		"pending_dms", status.PendingDMs,
+		"connected_orgs", len(status.ConnectedOrgs))
 
 	conn := "Disconnected"
 	if status.Connected {
@@ -278,6 +297,10 @@ func (h *SlashCommandHandler) generateAndSendReport(s *discordgo.Session, i *dis
 	guildID := i.GuildID
 	userID := i.Member.User.ID
 
+	h.logger.Info("generating report for user",
+		"guild_id", guildID,
+		"user_id", userID)
+
 	if h.reportGetter == nil {
 		h.editResponse(s, i, "Report generation is not configured.", nil)
 		return
@@ -285,15 +308,24 @@ func (h *SlashCommandHandler) generateAndSendReport(s *discordgo.Session, i *dis
 
 	report, err := h.reportGetter.Report(ctx, guildID, userID)
 	if err != nil {
-		h.logger.Error("failed to generate report", "error", err, "user_id", userID)
+		h.logger.Error("failed to generate report", "error", err, "user_id", userID, "guild_id", guildID)
 		h.editResponse(s, i, "Failed to generate report. Please try again later.", nil)
 		return
 	}
 
 	if report == nil || (len(report.IncomingPRs) == 0 && len(report.OutgoingPRs) == 0) {
+		h.logger.Info("no PRs found for user",
+			"user_id", userID,
+			"guild_id", guildID)
 		h.editResponse(s, i, "No PRs require your attention right now.", nil)
 		return
 	}
+
+	h.logger.Info("report generated successfully",
+		"user_id", userID,
+		"guild_id", guildID,
+		"incoming_prs", len(report.IncomingPRs),
+		"outgoing_prs", len(report.OutgoingPRs))
 
 	embed := h.formatReportEmbed(report)
 	h.editResponse(s, i, "", embed)
@@ -356,6 +388,10 @@ func (h *SlashCommandHandler) handleDashboardCommand(s *discordgo.Session, i *di
 	userID := i.Member.User.ID
 	guildID := i.GuildID
 
+	h.logger.Info("handling dashboard command",
+		"guild_id", guildID,
+		"user_id", userID)
+
 	// Get user's org info from status getter (includes all orgs for this guild)
 	var orgLinks string
 	if h.statusGetter != nil {
@@ -399,6 +435,10 @@ func (h *SlashCommandHandler) handleDashboardCommand(s *discordgo.Session, i *di
 }
 
 func (h *SlashCommandHandler) handleHelpCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	h.logger.Info("handling help command",
+		"guild_id", i.GuildID,
+		"user_id", i.Member.User.ID)
+
 	embed := &discordgo.MessageEmbed{
 		Title:       "reviewGOOSE Help",
 		Description: "I notify you about pull requests that need your attention.",

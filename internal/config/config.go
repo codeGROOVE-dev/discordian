@@ -44,6 +44,11 @@ type DiscordConfig struct {
 	Global   GlobalConfig             `yaml:"global"`
 }
 
+// GetUsers returns the user mappings (for reverse lookup interface).
+func (c *DiscordConfig) GetUsers() map[string]string {
+	return c.Users
+}
+
 // GlobalConfig holds global settings for the org.
 type GlobalConfig struct {
 	GuildID         string `yaml:"guild_id"`

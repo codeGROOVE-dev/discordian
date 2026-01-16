@@ -26,12 +26,20 @@ func (m *mockStateStore) SaveThread(_ context.Context, _, _ string, _ int, _ str
 	return nil
 }
 
+func (m *mockStateStore) ClaimThread(_ context.Context, _, _ string, _ int, _ string, _ time.Duration) bool {
+	return true // Always succeed in tests
+}
+
 func (m *mockStateStore) DMInfo(_ context.Context, _, _ string) (state.DMInfo, bool) {
 	return state.DMInfo{}, false
 }
 
 func (m *mockStateStore) SaveDMInfo(_ context.Context, _, _ string, _ state.DMInfo) error {
 	return nil
+}
+
+func (m *mockStateStore) ClaimDM(_ context.Context, _, _ string, _ time.Duration) bool {
+	return true // Always succeed in tests
 }
 
 func (m *mockStateStore) ListDMUsers(_ context.Context, _ string) []string {

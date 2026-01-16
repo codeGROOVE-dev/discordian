@@ -16,6 +16,7 @@ type MemoryStore struct {
 	processed    map[string]time.Time
 	pendingDMs   map[string]*PendingDM
 	dailyReports map[string]DailyReportInfo
+	claims       map[string]time.Time // claimKey -> expiry time
 	mu           sync.RWMutex
 	threadRetain time.Duration
 	dmRetain     time.Duration
@@ -31,6 +32,7 @@ func NewMemoryStore() *MemoryStore {
 		processed:    make(map[string]time.Time),
 		pendingDMs:   make(map[string]*PendingDM),
 		dailyReports: make(map[string]DailyReportInfo),
+		claims:       make(map[string]time.Time),
 		threadRetain: 30 * 24 * time.Hour, // 30 days
 		dmRetain:     90 * 24 * time.Hour, // 90 days
 		eventRetain:  24 * time.Hour,      // 1 day
@@ -72,6 +74,35 @@ func (s *MemoryStore) SaveThread(ctx context.Context, owner, repo string, number
 	return nil
 }
 
+// ClaimThread attempts to claim a thread for creation.
+// Returns true if the claim was successful, false if another goroutine already claimed it.
+func (s *MemoryStore) ClaimThread(ctx context.Context, owner, repo string, number int, channelID string, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	claimKey := fmt.Sprintf("claim:thread:%s", threadKey(owner, repo, number, channelID))
+
+	// Check if already claimed and not expired
+	if expiry, exists := s.claims[claimKey]; exists && time.Now().Before(expiry) {
+		slog.Debug("thread already claimed",
+			"owner", owner,
+			"repo", repo,
+			"number", number,
+			"channel_id", channelID)
+		return false
+	}
+
+	// Claim it
+	s.claims[claimKey] = time.Now().Add(ttl)
+	slog.Debug("successfully claimed thread",
+		"owner", owner,
+		"repo", repo,
+		"number", number,
+		"channel_id", channelID,
+		"ttl", ttl)
+	return true
+}
+
 // DMInfo returns DM info for a user/PR combination.
 func (s *MemoryStore) DMInfo(ctx context.Context, userID, prURL string) (DMInfo, bool) {
 	s.mu.RLock()
@@ -100,6 +131,31 @@ func (s *MemoryStore) SaveDMInfo(_ context.Context, userID, prURL string, info D
 		"channel_id", info.ChannelID)
 
 	return nil
+}
+
+// ClaimDM attempts to claim a DM for sending.
+// Returns true if the claim was successful, false if another goroutine already claimed it.
+func (s *MemoryStore) ClaimDM(ctx context.Context, userID, prURL string, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	claimKey := fmt.Sprintf("claim:dm:%s", dmKey(userID, prURL))
+
+	// Check if already claimed and not expired
+	if expiry, exists := s.claims[claimKey]; exists && time.Now().Before(expiry) {
+		slog.Debug("DM already claimed",
+			"user_id", userID,
+			"pr_url", prURL)
+		return false
+	}
+
+	// Claim it
+	s.claims[claimKey] = time.Now().Add(ttl)
+	slog.Debug("successfully claimed DM",
+		"user_id", userID,
+		"pr_url", prURL,
+		"ttl", ttl)
+	return true
 }
 
 // ListDMUsers returns all user IDs who received DMs for a PR.
@@ -236,11 +292,21 @@ func (s *MemoryStore) Cleanup(ctx context.Context) error {
 		}
 	}
 
-	if threadsCleaned > 0 || dmsCleaned > 0 || eventsCleaned > 0 {
+	// Clean expired claims
+	var claimsCleaned int
+	for key, expiry := range s.claims {
+		if now.After(expiry) {
+			delete(s.claims, key)
+			claimsCleaned++
+		}
+	}
+
+	if threadsCleaned > 0 || dmsCleaned > 0 || eventsCleaned > 0 || claimsCleaned > 0 {
 		slog.Info("cleaned up old state entries",
 			"threads", threadsCleaned,
 			"dms", dmsCleaned,
-			"events", eventsCleaned)
+			"events", eventsCleaned,
+			"claims", claimsCleaned)
 	}
 
 	return nil

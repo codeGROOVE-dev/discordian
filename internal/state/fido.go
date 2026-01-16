@@ -19,6 +19,7 @@ const (
 	eventTTL       = 2 * time.Hour       // Short - just for dedup
 	dailyReportTTL = 36 * time.Hour      // Slightly over 1 day to handle timezone edge cases
 	pendingDMTTL   = 4 * time.Hour       // Max time a DM can be pending
+	claimTTL       = 10 * time.Second    // Short TTL for claims - just enough to post message
 )
 
 // pendingDMQueue stores all pending DMs in a single persisted value.
@@ -42,6 +43,7 @@ type dmUserList struct {
 //   - discordian-reports: Daily report tracking
 //   - discordian-pending: Pending DM queue
 //   - discordian-events: Event deduplication (persisted for cross-instance safety)
+//   - discordian-claims: Distributed claims (persisted for cross-instance coordination)
 type FidoStore struct {
 	threads      *fido.TieredCache[string, ThreadInfo]
 	dmInfo       *fido.TieredCache[string, DMInfo]
@@ -49,6 +51,7 @@ type FidoStore struct {
 	dailyReports *fido.TieredCache[string, DailyReportInfo]
 	pendingDMs   *fido.TieredCache[string, pendingDMQueue]
 	events       *fido.TieredCache[string, time.Time] // Persisted for cross-instance dedup
+	claims       *fido.TieredCache[string, time.Time] // Persisted for cross-instance claim coordination
 
 	pendingMu sync.Mutex // Serializes pending DM operations
 }
@@ -63,6 +66,7 @@ type fidoStoreOptions struct {
 	reportStore  fido.Store[string, DailyReportInfo]
 	pendingStore fido.Store[string, pendingDMQueue]
 	eventStore   fido.Store[string, time.Time]
+	claimStore   fido.Store[string, time.Time]
 }
 
 // WithThreadStore sets a custom store for thread data.
@@ -93,6 +97,11 @@ func WithPendingStore(s fido.Store[string, pendingDMQueue]) FidoStoreOption {
 // WithEventStore sets a custom store for event deduplication data.
 func WithEventStore(s fido.Store[string, time.Time]) FidoStoreOption {
 	return func(o *fidoStoreOptions) { o.eventStore = s }
+}
+
+// WithClaimStore sets a custom store for claim data.
+func WithClaimStore(s fido.Store[string, time.Time]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.claimStore = s }
 }
 
 // NewFidoStore creates a new fido-backed store.
@@ -159,6 +168,15 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		}
 	}
 
+	claimStore := o.claimStore
+	if claimStore == nil {
+		var err error
+		claimStore, err = cloudrun.New[string, time.Time](ctx, "discordian-claims")
+		if err != nil {
+			return nil, fmt.Errorf("create claim store: %w", err)
+		}
+	}
+
 	threads, err := fido.NewTiered(threadStore, fido.TTL(threadTTL))
 	if err != nil {
 		return nil, fmt.Errorf("create thread cache: %w", err)
@@ -189,6 +207,11 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		return nil, fmt.Errorf("create event cache: %w", err)
 	}
 
+	claims, err := fido.NewTiered(claimStore, fido.TTL(claimTTL))
+	if err != nil {
+		return nil, fmt.Errorf("create claim cache: %w", err)
+	}
+
 	slog.Info("initialized fido store")
 	return &FidoStore{
 		threads:      threads,
@@ -197,6 +220,7 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		dailyReports: dailyReports,
 		pendingDMs:   pendingDMs,
 		events:       events,
+		claims:       claims,
 	}, nil
 }
 
@@ -216,6 +240,42 @@ func (s *FidoStore) SaveThread(ctx context.Context, owner, repo string, number i
 	key := fmt.Sprintf("%s/%s/%d/%s", owner, repo, number, channelID)
 	info.UpdatedAt = time.Now()
 	return s.threads.Set(ctx, key, info)
+}
+
+// ClaimThread attempts to claim a thread for creation.
+// Returns true if the claim was successful, false if another instance already claimed it.
+func (s *FidoStore) ClaimThread(ctx context.Context, owner, repo string, number int, channelID string, ttl time.Duration) bool {
+	claimKey := fmt.Sprintf("claim:thread:%s/%s/%d/%s", owner, repo, number, channelID)
+
+	// Check if already claimed
+	expiry, found, err := s.claims.Get(ctx, claimKey)
+	if err != nil {
+		slog.Debug("claim check error", "key", claimKey, "error", err)
+		// On error, allow claim to proceed (fail open)
+	}
+	if found && time.Now().Before(expiry) {
+		slog.Debug("thread already claimed by another instance",
+			"owner", owner,
+			"repo", repo,
+			"number", number,
+			"channel_id", channelID)
+		return false
+	}
+
+	// Claim it
+	expiry = time.Now().Add(ttl)
+	if err := s.claims.Set(ctx, claimKey, expiry); err != nil {
+		slog.Warn("failed to set claim", "key", claimKey, "error", err)
+		return false
+	}
+
+	slog.Debug("successfully claimed thread",
+		"owner", owner,
+		"repo", repo,
+		"number", number,
+		"channel_id", channelID,
+		"ttl", ttl)
+	return true
 }
 
 // DMInfo retrieves DM info for a user/PR.
@@ -258,6 +318,38 @@ func (s *FidoStore) SaveDMInfo(ctx context.Context, userID, prURL string, info D
 	}
 
 	return nil
+}
+
+// ClaimDM attempts to claim a DM for sending.
+// Returns true if the claim was successful, false if another instance already claimed it.
+func (s *FidoStore) ClaimDM(ctx context.Context, userID, prURL string, ttl time.Duration) bool {
+	claimKey := fmt.Sprintf("claim:dm:%s:%s", userID, prURL)
+
+	// Check if already claimed
+	expiry, found, err := s.claims.Get(ctx, claimKey)
+	if err != nil {
+		slog.Debug("dm claim check error", "key", claimKey, "error", err)
+		// On error, allow claim to proceed (fail open)
+	}
+	if found && time.Now().Before(expiry) {
+		slog.Debug("DM already claimed by another instance",
+			"user_id", userID,
+			"pr_url", prURL)
+		return false
+	}
+
+	// Claim it
+	expiry = time.Now().Add(ttl)
+	if err := s.claims.Set(ctx, claimKey, expiry); err != nil {
+		slog.Warn("failed to set DM claim", "key", claimKey, "error", err)
+		return false
+	}
+
+	slog.Debug("successfully claimed DM",
+		"user_id", userID,
+		"pr_url", prURL,
+		"ttl", ttl)
+	return true
 }
 
 // ListDMUsers returns all user IDs who received DMs for a PR.
@@ -442,6 +534,9 @@ func (s *FidoStore) Close() error {
 	}
 	if err := s.events.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close events: %w", err))
+	}
+	if err := s.claims.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close claims: %w", err))
 	}
 
 	if len(errs) > 0 {
