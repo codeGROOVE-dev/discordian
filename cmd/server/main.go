@@ -268,7 +268,6 @@ func runCoordinators(
 	}
 }
 
-
 func (cm *coordinatorManager) startCoordinators(ctx context.Context) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -492,7 +491,6 @@ func (cm *coordinatorManager) handleCoordinatorExit(org string, err error) {
 	delete(cm.active, org)
 	delete(cm.coordinators, org)
 }
-
 
 func (cm *coordinatorManager) shutdown() error {
 	cm.mu.Lock()

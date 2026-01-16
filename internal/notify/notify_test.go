@@ -33,6 +33,10 @@ func (m *mockStore) SaveThread(_ context.Context, _, _ string, _ int, _ string, 
 	return nil
 }
 
+func (m *mockStore) ClaimThread(_ context.Context, _, _ string, _ int, _ string, _ time.Duration) bool {
+	return true // Always succeed in tests
+}
+
 func (m *mockStore) DMInfo(_ context.Context, userID, prURL string) (state.DMInfo, bool) {
 	key := userID + ":" + prURL
 	info, ok := m.savedDMInfo[key]
@@ -46,6 +50,10 @@ func (m *mockStore) SaveDMInfo(_ context.Context, userID, prURL string, info sta
 	key := userID + ":" + prURL
 	m.savedDMInfo[key] = info
 	return nil
+}
+
+func (m *mockStore) ClaimDM(_ context.Context, _, _ string, _ time.Duration) bool {
+	return true // Always succeed in tests
 }
 
 func (m *mockStore) ListDMUsers(_ context.Context, _ string) []string {

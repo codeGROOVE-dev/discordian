@@ -59,8 +59,10 @@ type ConfigManager interface {
 type StateStore interface {
 	Thread(ctx context.Context, owner, repo string, number int, channelID string) (state.ThreadInfo, bool)
 	SaveThread(ctx context.Context, owner, repo string, number int, channelID string, info state.ThreadInfo) error
+	ClaimThread(ctx context.Context, owner, repo string, number int, channelID string, ttl time.Duration) bool
 	DMInfo(ctx context.Context, userID, prURL string) (state.DMInfo, bool)
 	SaveDMInfo(ctx context.Context, userID, prURL string, info state.DMInfo) error
+	ClaimDM(ctx context.Context, userID, prURL string, ttl time.Duration) bool
 	ListDMUsers(ctx context.Context, prURL string) []string // Returns all user IDs who received DMs for this PR
 	WasProcessed(ctx context.Context, eventKey string) bool
 	MarkProcessed(ctx context.Context, eventKey string, ttl time.Duration) error

@@ -153,10 +153,11 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	// Check if event already processed
 	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
 	if c.store.WasProcessed(ctx, eventKey) {
-		c.logger.Info("event already processed, skipping",
+		c.logger.Debug("event already processed, skipping",
 			"delivery_id", event.DeliveryID,
 			"event_key", eventKey,
-			"pr_url", event.URL)
+			"pr_url", event.URL,
+			"type", event.Type)
 		return nil
 	}
 
@@ -176,6 +177,8 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	}
 
 	// Call Turn API for PR analysis
+	// Use event.Timestamp (not PR's UpdatedAt) because some events like check runs
+	// don't update the PR's UpdatedAt field, but we need Turn to analyze current state
 	checkResp, err := c.turn.Check(ctx, event.URL, "", event.Timestamp)
 	if err != nil {
 		c.logger.Warn("turn API call failed", "error", err)
@@ -306,6 +309,27 @@ func (c *Coordinator) processChannel(
 	// Check for existing thread/message
 	threadInfo, exists := c.store.Thread(ctx, owner, repo, number, channelID)
 
+	// Skip channel message if we don't have basic PR info (Turn API failed)
+	// However, if message already exists in Discord, we should try to update it when Turn API recovers
+	if params.Title == "" || params.Author == "" {
+		if !exists || threadInfo.MessageID == "" {
+			// No existing message - skip creating a malformed one
+			c.logger.Warn("skipping channel message creation due to missing PR info",
+				"channel", channelName,
+				"pr", prURL,
+				"has_title", params.Title != "",
+				"has_author", params.Author != "")
+			return nil
+		}
+		// Message exists but Turn API failed - log but continue to allow cleanup/archival
+		c.logger.Warn("proceeding with limited PR info for existing message",
+			"channel", channelName,
+			"pr", prURL,
+			"message_id", threadInfo.MessageID,
+			"has_title", params.Title != "",
+			"has_author", params.Author != "")
+	}
+
 	// Auto-detect forum channels from Discord API
 	if c.discord.IsForumChannel(ctx, channelID) {
 		return c.processForumChannel(ctx, channelID, owner, repo, number, params, threadInfo, exists)
@@ -359,12 +383,54 @@ func (c *Coordinator) processForumChannel(
 		c.logger.Warn("failed to update forum post, will search/create", "error", err)
 	}
 
-	// Cross-instance race prevention: sleep then search before creating
+	// Try to claim this thread creation
+	const claimTTL = 10 * time.Second
+	if !c.store.ClaimThread(ctx, owner, repo, number, channelID, claimTTL) {
+		// Another instance claimed it, search for their thread
+		c.logger.Info("another instance claimed forum thread, searching for their thread",
+			"pr", params.PRURL)
+
+		// Wait briefly for the other instance to post
+		time.Sleep(crossInstanceRaceDelay * 2)
+
+		// Search for existing thread created by the other instance
+		if foundThreadID, foundMsgID, found := c.discord.FindForumThread(ctx, channelID, params.PRURL); found {
+			c.logger.Info("found forum thread created by another instance",
+				"thread_id", foundThreadID,
+				"pr", params.PRURL)
+
+			// Save the found thread and update it
+			newInfo := state.ThreadInfo{
+				ThreadID:    foundThreadID,
+				MessageID:   foundMsgID,
+				ChannelID:   channelID,
+				ChannelType: "forum",
+				LastState:   string(params.State),
+				MessageText: content,
+			}
+			if err := c.store.SaveThread(ctx, owner, repo, number, channelID, newInfo); err != nil {
+				c.logger.Warn("failed to save found thread info", "error", err)
+			}
+
+			// Update the found thread with current content
+			if err := c.discord.UpdateForumPost(ctx, foundThreadID, foundMsgID, title, content); err != nil {
+				c.logger.Warn("failed to update found forum post", "error", err)
+			}
+
+			c.trackTaggedUsers(params)
+			return nil
+		}
+
+		c.logger.Warn("another instance claimed forum thread but not found, proceeding to create",
+			"pr", params.PRURL)
+	}
+
+	// We claimed it - brief delay then search once more before creating
 	time.Sleep(crossInstanceRaceDelay)
 
-	// Search for existing thread created by another instance
+	// Search for existing thread (in case claim race occurred)
 	if foundThreadID, foundMsgID, found := c.discord.FindForumThread(ctx, channelID, params.PRURL); found {
-		c.logger.Info("found existing forum thread from another instance",
+		c.logger.Info("found existing forum thread from search",
 			"thread_id", foundThreadID,
 			"pr", params.PRURL)
 
@@ -461,23 +527,33 @@ func (c *Coordinator) processTextChannel(
 			"has_message_id", exists && threadInfo.MessageID != "")
 	}
 
-	// Cross-instance race prevention: sleep then search before creating
-	time.Sleep(crossInstanceRaceDelay)
-
-	// Search for existing message created by another instance
-	if foundMsgID, found := c.discord.FindChannelMessage(ctx, channelID, params.PRURL); found {
-		c.logger.Info("found existing channel message from search",
-			"message_id", foundMsgID,
+	// Try to claim this thread creation
+	const claimTTL = 10 * time.Second
+	if !c.store.ClaimThread(ctx, owner, repo, number, channelID, claimTTL) {
+		// Another instance claimed it, search for their message
+		c.logger.Info("another instance claimed thread, searching for their message",
 			"pr", params.PRURL)
 
-		// Check if content actually changed before updating
-		currentContent, err := c.discord.MessageContent(ctx, channelID, foundMsgID)
-		if err == nil && currentContent == content {
-			c.logger.Info("found message content unchanged, skipping update",
+		// Wait briefly for the other instance to post
+		time.Sleep(crossInstanceRaceDelay * 2)
+
+		// Search for existing message created by the other instance
+		if foundMsgID, found := c.discord.FindChannelMessage(ctx, channelID, params.PRURL); found {
+			c.logger.Info("found message created by another instance",
 				"message_id", foundMsgID,
 				"pr", params.PRURL)
 
-			// Still save thread info to cache for future lookups
+			// Check if content needs updating
+			currentContent, err := c.discord.MessageContent(ctx, channelID, foundMsgID)
+			if err == nil && currentContent == content {
+				c.logger.Info("found message content unchanged, skipping update",
+					"message_id", foundMsgID,
+					"pr", params.PRURL)
+			} else if err := c.discord.UpdateMessage(ctx, channelID, foundMsgID, content); err != nil {
+				c.logger.Warn("failed to update found message", "error", err)
+			}
+
+			// Save thread info to cache
 			newInfo := state.ThreadInfo{
 				MessageID:   foundMsgID,
 				ChannelID:   channelID,
@@ -493,12 +569,30 @@ func (c *Coordinator) processTextChannel(
 			return nil
 		}
 
-		// Content changed or couldn't fetch - update the message
-		if err := c.discord.UpdateMessage(ctx, channelID, foundMsgID, content); err != nil {
+		c.logger.Warn("another instance claimed but message not found, proceeding to create",
+			"pr", params.PRURL)
+	}
+
+	// We claimed it - brief delay then search once more before creating
+	time.Sleep(crossInstanceRaceDelay)
+
+	// Search for existing message (in case claim race occurred)
+	if foundMsgID, found := c.discord.FindChannelMessage(ctx, channelID, params.PRURL); found {
+		c.logger.Info("found existing channel message from search",
+			"message_id", foundMsgID,
+			"pr", params.PRURL)
+
+		// Check if content actually changed before updating
+		currentContent, err := c.discord.MessageContent(ctx, channelID, foundMsgID)
+		if err == nil && currentContent == content {
+			c.logger.Info("found message content unchanged, skipping update",
+				"message_id", foundMsgID,
+				"pr", params.PRURL)
+		} else if err := c.discord.UpdateMessage(ctx, channelID, foundMsgID, content); err != nil {
 			c.logger.Warn("failed to update found message", "error", err)
 		}
 
-		// Save the updated info
+		// Save thread info to cache
 		newInfo := state.ThreadInfo{
 			MessageID:   foundMsgID,
 			ChannelID:   channelID,
@@ -706,7 +800,56 @@ func (c *Coordinator) processDMForUser(
 		// Fall through to potentially queue new DM
 	}
 
-	// New DM - check delay configuration
+	// New DM - try to claim it to prevent duplicate DMs from multiple instances
+	const dmClaimTTL = 10 * time.Second
+	if !c.store.ClaimDM(ctx, discordID, prURL, dmClaimTTL) {
+		// Another instance claimed this DM, search for it
+		c.logger.Debug("another instance claimed DM, searching for their message",
+			"user", username,
+			"pr_url", prURL)
+
+		// Brief wait for other instance to create/queue DM
+		time.Sleep(200 * time.Millisecond)
+
+		// Check if DM was created by other instance
+		if foundChannelID, foundMsgID, found := c.discord.FindDMForPR(ctx, discordID, prURL); found {
+			c.logger.Info("found DM created by another instance",
+				"user_id", discordID,
+				"pr_url", prURL)
+
+			// Save the found DM info
+			dmInfo = state.DMInfo{
+				ChannelID:   foundChannelID,
+				MessageID:   foundMsgID,
+				MessageText: newMessage,
+				LastState:   string(prState),
+				SentAt:      time.Now(),
+			}
+			if err := c.store.SaveDMInfo(ctx, discordID, prURL, dmInfo); err != nil {
+				c.logger.Warn("failed to save found DM info", "error", err)
+			}
+			return
+		}
+
+		// DM not found yet, maybe queued - check pending DMs
+		pendingDMs, err := c.store.PendingDMs(ctx, time.Now().Add(24*time.Hour))
+		if err == nil {
+			for _, pendingDM := range pendingDMs {
+				if pendingDM.UserID == discordID && pendingDM.PRURL == prURL {
+					c.logger.Debug("DM already queued by another instance",
+						"user", username,
+						"pr_url", prURL)
+					return
+				}
+			}
+		}
+
+		c.logger.Warn("another instance claimed DM but not found, proceeding to queue",
+			"user", username,
+			"pr_url", prURL)
+	}
+
+	// Check delay configuration
 	channels := c.config.ChannelsForRepo(c.org, repo)
 	delay := 65 // default
 	if len(channels) > 0 {
@@ -984,31 +1127,28 @@ func (c *Coordinator) PollAndReconcile(ctx context.Context) {
 
 // reconcilePR checks a single PR's state and updates Discord if needed.
 func (c *Coordinator) reconcilePR(ctx context.Context, pr PRSearchResult) {
-	// Check if already processed at this update time
-	pollKey := fmt.Sprintf("poll:%s:%s", pr.URL, pr.UpdatedAt.Format(time.RFC3339))
-	if c.store.WasProcessed(ctx, pollKey) {
-		return // Already processed this PR at this update time
-	}
+	c.logger.Debug("reconciling PR",
+		"pr_url", pr.URL,
+		"updated_at", pr.UpdatedAt.Format(time.RFC3339))
 
 	// Create a synthetic event for processing
+	// Use UpdatedAt for both timestamp and deliveryID. Real webhook events use their
+	// own event timestamp (which may be newer than UpdatedAt for events like check runs),
+	// but for polling we use UpdatedAt since that's all we have from the GitHub API.
+	// This also provides deduplication: we only re-process when the PR actually updates.
 	event := SprinklerEvent{
 		Type:       "poll",
 		URL:        pr.URL,
 		Timestamp:  pr.UpdatedAt,
-		DeliveryID: fmt.Sprintf("poll-%s-%d", pr.URL, time.Now().UnixNano()),
+		DeliveryID: fmt.Sprintf("poll-%s-%s", pr.URL, pr.UpdatedAt.Format(time.RFC3339)),
 	}
 
 	// Process the event (reuses all the normal event processing logic)
+	// This will check Discord state and update if needed
 	if err := c.processEventSync(ctx, event); err != nil {
 		c.logger.Warn("failed to reconcile PR",
 			"url", pr.URL,
 			"error", err)
-		return // Don't mark as processed - allow retry next cycle
-	}
-
-	// Mark as processed only after successful processing
-	if err := c.store.MarkProcessed(ctx, pollKey, eventDeduplicationTTL); err != nil {
-		c.logger.Warn("failed to mark poll event as processed", "error", err, "pr_url", pr.URL)
 	}
 }
 

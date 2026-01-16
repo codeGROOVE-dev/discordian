@@ -52,10 +52,17 @@ type Store interface {
 	Thread(ctx context.Context, owner, repo string, number int, channelID string) (ThreadInfo, bool)
 	SaveThread(ctx context.Context, owner, repo string, number int, channelID string, info ThreadInfo) error
 
+	// Distributed claim mechanism to prevent duplicate thread/message creation across instances
+	// Returns true if claim was successful, false if another instance already claimed it
+	ClaimThread(ctx context.Context, owner, repo string, number int, channelID string, ttl time.Duration) bool
+
 	// DM tracking
 	DMInfo(ctx context.Context, userID, prURL string) (DMInfo, bool)
 	SaveDMInfo(ctx context.Context, userID, prURL string, info DMInfo) error
 	ListDMUsers(ctx context.Context, prURL string) []string // Returns all user IDs who received DMs for this PR
+
+	// Distributed claim mechanism for DMs
+	ClaimDM(ctx context.Context, userID, prURL string, ttl time.Duration) bool
 
 	// Event deduplication
 	WasProcessed(ctx context.Context, eventKey string) bool
