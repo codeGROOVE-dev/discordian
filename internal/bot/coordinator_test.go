@@ -108,7 +108,8 @@ func (m *mockDiscordClient) UpdateForumPost(_ context.Context, _, _, _, _ string
 	return nil
 }
 
-func (m *mockDiscordClient) ArchiveThread(_ context.Context, _ string) error {
+func (m *mockDiscordClient) ArchiveThread(_ context.Context, threadID string) error {
+	m.archivedThreads = append(m.archivedThreads, threadID)
 	return nil
 }
 
@@ -156,7 +157,11 @@ func (m *mockDiscordClient) GuildID() string {
 	return m.guildID
 }
 
-func (m *mockDiscordClient) FindForumThread(_ context.Context, _, _ string) (string, string, bool) {
+func (m *mockDiscordClient) FindForumThread(_ context.Context, channelID, prURL string) (string, string, bool) {
+	key := channelID + ":" + prURL
+	if thread, exists := m.foundForumThreads[key]; exists {
+		return thread.threadID, thread.messageID, true
+	}
 	return "", "", false
 }
 
@@ -187,25 +192,7 @@ func (m *mockDiscordClient) FindDMForPR(_ context.Context, userID, prURL string)
 	return "", "", false
 }
 
-func (m *mockDiscordClient) UpdateForumPost(_ context.Context, threadID, messageID, title, content string) error {
-	// Track update attempt
-	return nil
-}
-
-func (m *mockDiscordClient) ArchiveThread(_ context.Context, threadID string) error {
-	m.archivedThreads = append(m.archivedThreads, threadID)
-	return nil
-}
-
-func (m *mockDiscordClient) FindForumThread(_ context.Context, channelID, prURL string) (string, string, bool) {
-	key := channelID + ":" + prURL
-	if thread, exists := m.foundForumThreads[key]; exists {
-		return thread.threadID, thread.messageID, true
-	}
-	return "", "", false
-}
-
-type mockConfigManager struct {
+type mockConfigManager struct{
 	configs      map[string]*config.DiscordConfig
 	channels     map[string][]string // org:repo -> channels
 	whenSettings map[string]string   // org:channel -> when value
@@ -225,6 +212,7 @@ func (m *mockConfigManager) LoadConfig(_ context.Context, _ string) error {
 }
 
 func (m *mockConfigManager) ReloadConfig(_ context.Context, _ string) error {
+	m.reloadCount++
 	return nil
 }
 
@@ -253,7 +241,11 @@ func (m *mockConfigManager) ReminderDMDelay(_, _ string) int {
 	return 65
 }
 
-func (m *mockConfigManager) When(_, _ string) string {
+func (m *mockConfigManager) When(org, channel string) string {
+	key := org + ":" + channel
+	if when, exists := m.whenSettings[key]; exists {
+		return when
+	}
 	return "immediate"
 }
 
@@ -264,7 +256,9 @@ func (m *mockConfigManager) GuildID(_ string) string {
 func (m *mockConfigManager) SetGitHubClient(_ string, _ any) {}
 
 type mockTurnClient struct {
-	responses map[string]*CheckResponse
+	responses  map[string]*CheckResponse
+	callCount  int
+	shouldFail bool
 }
 
 func newMockTurnClient() *mockTurnClient {
@@ -274,6 +268,10 @@ func newMockTurnClient() *mockTurnClient {
 }
 
 func (m *mockTurnClient) Check(_ context.Context, prURL, _ string, _ time.Time) (*CheckResponse, error) {
+	m.callCount++
+	if m.shouldFail {
+		return nil, fmt.Errorf("mock turn API failure")
+	}
 	if resp, ok := m.responses[prURL]; ok {
 		return resp, nil
 	}
@@ -329,6 +327,7 @@ type mockStore struct {
 	shouldFailPendingDMs  bool
 	failRemoveDMID        string
 	claimThreadShouldFail bool
+	shouldFailClaimDM     bool
 }
 
 func newMockStore() *mockStore {
@@ -368,6 +367,13 @@ func (m *mockStore) ClaimThread(ctx context.Context, owner, repo string, number 
 		return false
 	}
 	return m.Store.ClaimThread(ctx, owner, repo, number, channelID, ttl)
+}
+
+func (m *mockStore) ClaimDM(ctx context.Context, userID, prURL string, ttl time.Duration) bool {
+	if m.shouldFailClaimDM {
+		return false
+	}
+	return m.Store.ClaimDM(ctx, userID, prURL, ttl)
 }
 
 func TestNewCoordinator(t *testing.T) {
@@ -4162,7 +4168,7 @@ func TestCoordinator_processDMForUser_ClaimFailed(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/1"
 
 	// Set up user mapping
-	userMapper.cache["alice"] = "discord123"
+	userMapper.mappings["alice"] = "discord123"
 	discord.usersInGuild["discord123"] = true
 
 	checkResp := &CheckResponse{
@@ -4206,7 +4212,7 @@ func TestCoordinator_processDMForUser_PendingDMUpdate(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/1"
 
 	// Set up user mapping
-	userMapper.cache["alice"] = "discord123"
+	userMapper.mappings["alice"] = "discord123"
 	discord.usersInGuild["discord123"] = true
 
 	checkResp := &CheckResponse{
@@ -4259,7 +4265,7 @@ func TestCoordinator_processDMForUser_FindDMFallback(t *testing.T) {
 	prURL := "https://github.com/owner/repo/pull/1"
 
 	// Set up user mapping
-	userMapper.cache["alice"] = "discord123"
+	userMapper.mappings["alice"] = "discord123"
 	discord.usersInGuild["discord123"] = true
 
 	// DM exists in Discord history but not in store
