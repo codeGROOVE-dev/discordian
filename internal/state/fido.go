@@ -15,13 +15,10 @@ import (
 const (
 	threadTTL      = 30 * 24 * time.Hour // 30 days - PRs can be open a while
 	dmInfoTTL      = 7 * 24 * time.Hour  // 7 days
+	dmUserListTTL  = 7 * 24 * time.Hour  // 7 days - same as dmInfo
 	eventTTL       = 2 * time.Hour       // Short - just for dedup
 	dailyReportTTL = 36 * time.Hour      // Slightly over 1 day to handle timezone edge cases
 	pendingDMTTL   = 4 * time.Hour       // Max time a DM can be pending
-
-	// maxEventMapSize is the maximum number of entries before inline cleanup.
-	// This prevents unbounded memory growth between scheduled cleanups.
-	maxEventMapSize = 10000
 )
 
 // pendingDMQueue stores all pending DMs in a single persisted value.
@@ -30,29 +27,28 @@ type pendingDMQueue struct {
 	DMs map[string]PendingDM `json:"dms"`
 }
 
+// dmUserList stores all user IDs who received DMs for a specific PR.
+// This ensures the list survives restarts and works across instances.
+type dmUserList struct {
+	UserIDs map[string]bool `json:"user_ids"` // userID -> true
+}
+
 // FidoStore implements Store using fido with CloudRun backend.
 //
 // Requires these Datastore databases (must be created before use):
 //   - discordian-threads: PR to Discord thread/message mapping
 //   - discordian-dms: DM message tracking
+//   - discordian-dmusers: DM user lists (prURL -> list of user IDs)
 //   - discordian-reports: Daily report tracking
 //   - discordian-pending: Pending DM queue
-//
-// Event deduplication is in-memory only (2h TTL, not worth persisting).
+//   - discordian-events: Event deduplication (persisted for cross-instance safety)
 type FidoStore struct {
 	threads      *fido.TieredCache[string, ThreadInfo]
 	dmInfo       *fido.TieredCache[string, DMInfo]
+	dmUserLists  *fido.TieredCache[string, dmUserList] // Persisted: prURL -> user IDs
 	dailyReports *fido.TieredCache[string, DailyReportInfo]
 	pendingDMs   *fido.TieredCache[string, pendingDMQueue]
-
-	// Event dedup is in-memory only - short TTL, not critical to persist
-	events   map[string]time.Time
-	eventsMu sync.RWMutex
-
-	// Reverse index: prURL -> userIDs who received DMs
-	// Populated when SaveDMInfo is called
-	dmUserIndex   map[string]map[string]bool
-	dmUserIndexMu sync.RWMutex
+	events       *fido.TieredCache[string, time.Time] // Persisted for cross-instance dedup
 
 	pendingMu sync.Mutex // Serializes pending DM operations
 }
@@ -63,8 +59,10 @@ type FidoStoreOption func(*fidoStoreOptions)
 type fidoStoreOptions struct {
 	threadStore  fido.Store[string, ThreadInfo]
 	dmStore      fido.Store[string, DMInfo]
+	dmUserStore  fido.Store[string, dmUserList]
 	reportStore  fido.Store[string, DailyReportInfo]
 	pendingStore fido.Store[string, pendingDMQueue]
+	eventStore   fido.Store[string, time.Time]
 }
 
 // WithThreadStore sets a custom store for thread data.
@@ -77,6 +75,11 @@ func WithDMStore(s fido.Store[string, DMInfo]) FidoStoreOption {
 	return func(o *fidoStoreOptions) { o.dmStore = s }
 }
 
+// WithDMUserStore sets a custom store for DM user list data.
+func WithDMUserStore(s fido.Store[string, dmUserList]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.dmUserStore = s }
+}
+
 // WithReportStore sets a custom store for daily report data.
 func WithReportStore(s fido.Store[string, DailyReportInfo]) FidoStoreOption {
 	return func(o *fidoStoreOptions) { o.reportStore = s }
@@ -85,6 +88,11 @@ func WithReportStore(s fido.Store[string, DailyReportInfo]) FidoStoreOption {
 // WithPendingStore sets a custom store for pending DM data.
 func WithPendingStore(s fido.Store[string, pendingDMQueue]) FidoStoreOption {
 	return func(o *fidoStoreOptions) { o.pendingStore = s }
+}
+
+// WithEventStore sets a custom store for event deduplication data.
+func WithEventStore(s fido.Store[string, time.Time]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.eventStore = s }
 }
 
 // NewFidoStore creates a new fido-backed store.
@@ -115,6 +123,15 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		}
 	}
 
+	dmUserStore := o.dmUserStore
+	if dmUserStore == nil {
+		var err error
+		dmUserStore, err = cloudrun.New[string, dmUserList](ctx, "discordian-dmusers")
+		if err != nil {
+			return nil, fmt.Errorf("create dm user store: %w", err)
+		}
+	}
+
 	reportStore := o.reportStore
 	if reportStore == nil {
 		var err error
@@ -133,6 +150,15 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		}
 	}
 
+	eventStore := o.eventStore
+	if eventStore == nil {
+		var err error
+		eventStore, err = cloudrun.New[string, time.Time](ctx, "discordian-events")
+		if err != nil {
+			return nil, fmt.Errorf("create event store: %w", err)
+		}
+	}
+
 	threads, err := fido.NewTiered(threadStore, fido.TTL(threadTTL))
 	if err != nil {
 		return nil, fmt.Errorf("create thread cache: %w", err)
@@ -141,6 +167,11 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 	dmInfo, err := fido.NewTiered(dmStore, fido.TTL(dmInfoTTL))
 	if err != nil {
 		return nil, fmt.Errorf("create dm cache: %w", err)
+	}
+
+	dmUserLists, err := fido.NewTiered(dmUserStore, fido.TTL(dmUserListTTL))
+	if err != nil {
+		return nil, fmt.Errorf("create dm user list cache: %w", err)
 	}
 
 	dailyReports, err := fido.NewTiered(reportStore, fido.TTL(dailyReportTTL))
@@ -153,14 +184,19 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		return nil, fmt.Errorf("create pending cache: %w", err)
 	}
 
+	events, err := fido.NewTiered(eventStore, fido.TTL(eventTTL))
+	if err != nil {
+		return nil, fmt.Errorf("create event cache: %w", err)
+	}
+
 	slog.Info("initialized fido store")
 	return &FidoStore{
 		threads:      threads,
 		dmInfo:       dmInfo,
+		dmUserLists:  dmUserLists,
 		dailyReports: dailyReports,
 		pendingDMs:   pendingDMs,
-		events:       make(map[string]time.Time),
-		dmUserIndex:  make(map[string]map[string]bool),
+		events:       events,
 	}, nil
 }
 
@@ -197,46 +233,58 @@ func (s *FidoStore) DMInfo(ctx context.Context, userID, prURL string) (DMInfo, b
 func (s *FidoStore) SaveDMInfo(ctx context.Context, userID, prURL string, info DMInfo) error {
 	key := fmt.Sprintf("%s:%s", userID, prURL)
 
-	// Persist first, then update index only on success
-	// This prevents index inconsistency if persistence fails
+	// Persist DM info first
 	if err := s.dmInfo.Set(ctx, key, info); err != nil {
 		return err
 	}
 
-	// Update reverse index after successful persistence
-	s.dmUserIndexMu.Lock()
-	if s.dmUserIndex[prURL] == nil {
-		s.dmUserIndex[prURL] = make(map[string]bool)
+	// Update persisted user list for this PR
+	// Get current list
+	userList, _, err := s.dmUserLists.Get(ctx, prURL)
+	if err != nil {
+		slog.Debug("dm user list fetch error, creating new", "pr_url", prURL, "error", err)
 	}
-	s.dmUserIndex[prURL][userID] = true
-	s.dmUserIndexMu.Unlock()
+	if userList.UserIDs == nil {
+		userList.UserIDs = make(map[string]bool)
+	}
+
+	// Add this user
+	userList.UserIDs[userID] = true
+
+	// Save back to persistent cache
+	if err := s.dmUserLists.Set(ctx, prURL, userList); err != nil {
+		slog.Warn("failed to persist dm user list", "pr_url", prURL, "error", err)
+		// Don't fail the overall operation - the DM info is saved
+	}
 
 	return nil
 }
 
 // ListDMUsers returns all user IDs who received DMs for a PR.
-func (s *FidoStore) ListDMUsers(_ context.Context, prURL string) []string {
-	s.dmUserIndexMu.RLock()
-	defer s.dmUserIndexMu.RUnlock()
-
-	users := s.dmUserIndex[prURL]
-	if users == nil {
+func (s *FidoStore) ListDMUsers(ctx context.Context, prURL string) []string {
+	userList, found, err := s.dmUserLists.Get(ctx, prURL)
+	if err != nil {
+		slog.Debug("dm user list lookup error", "pr_url", prURL, "error", err)
+		return nil
+	}
+	if !found || userList.UserIDs == nil {
 		return nil
 	}
 
-	result := make([]string, 0, len(users))
-	for userID := range users {
+	result := make([]string, 0, len(userList.UserIDs))
+	for userID := range userList.UserIDs {
 		result = append(result, userID)
 	}
 	return result
 }
 
 // WasProcessed checks if an event was already processed.
-func (s *FidoStore) WasProcessed(_ context.Context, eventKey string) bool {
-	s.eventsMu.RLock()
-	expiry, found := s.events[eventKey]
-	s.eventsMu.RUnlock()
-
+func (s *FidoStore) WasProcessed(ctx context.Context, eventKey string) bool {
+	expiry, found, err := s.events.Get(ctx, eventKey)
+	if err != nil {
+		slog.Debug("event lookup error", "key", eventKey, "error", err)
+		return false
+	}
 	if !found {
 		return false
 	}
@@ -244,25 +292,9 @@ func (s *FidoStore) WasProcessed(_ context.Context, eventKey string) bool {
 }
 
 // MarkProcessed marks an event as processed.
-func (s *FidoStore) MarkProcessed(_ context.Context, eventKey string, ttl time.Duration) error {
-	s.eventsMu.Lock()
-	defer s.eventsMu.Unlock()
-
-	s.events[eventKey] = time.Now().Add(ttl)
-
-	// Inline cleanup if map grows too large to prevent memory exhaustion
-	if len(s.events) > maxEventMapSize {
-		now := time.Now()
-		for key, expiry := range s.events {
-			if now.After(expiry) {
-				delete(s.events, key)
-			}
-		}
-		slog.Debug("performed inline event map cleanup",
-			"remaining", len(s.events))
-	}
-
-	return nil
+func (s *FidoStore) MarkProcessed(ctx context.Context, eventKey string, ttl time.Duration) error {
+	expiry := time.Now().Add(ttl)
+	return s.events.Set(ctx, eventKey, expiry)
 }
 
 // DailyReportInfo retrieves daily report info for a user.
@@ -349,53 +381,8 @@ func (s *FidoStore) RemovePendingDM(ctx context.Context, id string) error {
 
 // Cleanup removes expired entries.
 func (s *FidoStore) Cleanup(ctx context.Context) error {
+	// Most entries (threads, dmInfo, dmUserLists, events) are managed by fido cache with automatic TTL cleanup
 	now := time.Now()
-
-	// Clean up expired events from memory
-	s.eventsMu.Lock()
-	for key, expiry := range s.events {
-		if now.After(expiry) {
-			delete(s.events, key)
-		}
-	}
-	eventCount := len(s.events)
-	s.eventsMu.Unlock()
-
-	// Clean up stale dmUserIndex entries
-	// Remove entries for PRs that haven't been updated recently
-	s.dmUserIndexMu.Lock()
-	dmIndexCount := len(s.dmUserIndex)
-	// dmUserIndex entries older than dmInfoTTL are stale
-	// Since we don't track timestamps per entry, we rely on the underlying
-	// dmInfo cache to have evicted the data; if all users for a PR are gone
-	// from dmInfo, we can remove the index entry
-	for prURL, users := range s.dmUserIndex {
-		allGone := true
-		for userID := range users {
-			key := fmt.Sprintf("%s:%s", userID, prURL)
-			_, found, err := s.dmInfo.Get(ctx, key)
-			if err != nil {
-				slog.Debug("dmUserIndex cleanup: error checking dmInfo",
-					"key", key,
-					"error", err)
-			}
-			if found {
-				allGone = false
-				break
-			}
-		}
-		if allGone {
-			delete(s.dmUserIndex, prURL)
-		}
-	}
-	cleanedDMIndex := dmIndexCount - len(s.dmUserIndex)
-	s.dmUserIndexMu.Unlock()
-
-	if cleanedDMIndex > 0 {
-		slog.Debug("cleaned up stale dmUserIndex entries",
-			"removed", cleanedDMIndex,
-			"remaining", len(s.dmUserIndex))
-	}
 
 	// Clean up stale pending DMs
 	s.pendingMu.Lock()
@@ -403,9 +390,7 @@ func (s *FidoStore) Cleanup(ctx context.Context) error {
 
 	queue, _, err := s.pendingDMs.Get(ctx, pendingQueueKey)
 	if err != nil {
-		slog.Debug("cleanup: pending DM fetch info",
-			"events_remaining", eventCount,
-			"error", err)
+		slog.Debug("cleanup: pending DM fetch error", "error", err)
 		return nil
 	}
 
@@ -446,11 +431,17 @@ func (s *FidoStore) Close() error {
 	if err := s.dmInfo.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close dmInfo: %w", err))
 	}
+	if err := s.dmUserLists.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close dmUserLists: %w", err))
+	}
 	if err := s.dailyReports.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close dailyReports: %w", err))
 	}
 	if err := s.pendingDMs.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close pendingDMs: %w", err))
+	}
+	if err := s.events.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close events: %w", err))
 	}
 
 	if len(errs) > 0 {

@@ -150,14 +150,17 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 		return nil // Don't post notifications for config repo PRs
 	}
 
-	// Deduplicate by delivery ID
+	// Check if event already processed
 	eventKey := fmt.Sprintf("%s:%s", event.DeliveryID, event.URL)
 	if c.store.WasProcessed(ctx, eventKey) {
-		c.logger.Debug("skipping duplicate event", "delivery_id", event.DeliveryID)
+		c.logger.Info("event already processed, skipping",
+			"delivery_id", event.DeliveryID,
+			"event_key", eventKey,
+			"pr_url", event.URL)
 		return nil
 	}
 
-	// Lock per PR URL to prevent race conditions (duplicate threads/messages)
+	// Lock per PR URL to prevent duplicate threads/messages
 	prLock := c.prLock(event.URL)
 	prLock.Lock()
 	defer prLock.Unlock()
@@ -218,9 +221,9 @@ func (c *Coordinator) processEventSync(ctx context.Context, event SprinklerEvent
 	// Queue DM notifications
 	c.queueDMNotifications(ctx, owner, repo, number, checkResp, prState)
 
-	// Mark as processed
+	// Mark event as processed after successful completion
 	if err := c.store.MarkProcessed(ctx, eventKey, eventDeduplicationTTL); err != nil {
-		c.logger.Warn("failed to mark event processed", "error", err)
+		c.logger.Warn("failed to mark event as processed", "error", err, "delivery_id", event.DeliveryID)
 	}
 
 	return nil
@@ -422,9 +425,15 @@ func (c *Coordinator) processTextChannel(
 	content := format.ChannelMessage(params)
 
 	if exists && threadInfo.MessageID != "" {
+		c.logger.Info("found thread in cache",
+			"message_id", threadInfo.MessageID,
+			"channel_id", channelID,
+			"pr", params.PRURL,
+			"last_state", threadInfo.LastState)
+
 		// Content comparison: skip update if content unchanged
 		if threadInfo.MessageText == content {
-			c.logger.Debug("channel message unchanged, skipping update",
+			c.logger.Info("channel message unchanged, skipping update",
 				"message_id", threadInfo.MessageID,
 				"pr", params.PRURL)
 			c.trackTaggedUsers(params)
@@ -444,6 +453,12 @@ func (c *Coordinator) processTextChannel(
 			return nil
 		}
 		c.logger.Warn("failed to update message, will search/create", "error", err)
+	} else {
+		c.logger.Info("thread not found in cache, will search channel history",
+			"channel_id", channelID,
+			"pr", params.PRURL,
+			"exists", exists,
+			"has_message_id", exists && threadInfo.MessageID != "")
 	}
 
 	// Cross-instance race prevention: sleep then search before creating
@@ -451,11 +466,39 @@ func (c *Coordinator) processTextChannel(
 
 	// Search for existing message created by another instance
 	if foundMsgID, found := c.discord.FindChannelMessage(ctx, channelID, params.PRURL); found {
-		c.logger.Info("found existing channel message from another instance",
+		c.logger.Info("found existing channel message from search",
 			"message_id", foundMsgID,
 			"pr", params.PRURL)
 
-		// Save the found message and update it
+		// Check if content actually changed before updating
+		currentContent, err := c.discord.MessageContent(ctx, channelID, foundMsgID)
+		if err == nil && currentContent == content {
+			c.logger.Info("found message content unchanged, skipping update",
+				"message_id", foundMsgID,
+				"pr", params.PRURL)
+
+			// Still save thread info to cache for future lookups
+			newInfo := state.ThreadInfo{
+				MessageID:   foundMsgID,
+				ChannelID:   channelID,
+				ChannelType: "text",
+				LastState:   string(params.State),
+				MessageText: content,
+			}
+			if err := c.store.SaveThread(ctx, owner, repo, number, channelID, newInfo); err != nil {
+				c.logger.Warn("failed to save found message info", "error", err)
+			}
+
+			c.trackTaggedUsers(params)
+			return nil
+		}
+
+		// Content changed or couldn't fetch - update the message
+		if err := c.discord.UpdateMessage(ctx, channelID, foundMsgID, content); err != nil {
+			c.logger.Warn("failed to update found message", "error", err)
+		}
+
+		// Save the updated info
 		newInfo := state.ThreadInfo{
 			MessageID:   foundMsgID,
 			ChannelID:   channelID,
@@ -465,11 +508,6 @@ func (c *Coordinator) processTextChannel(
 		}
 		if err := c.store.SaveThread(ctx, owner, repo, number, channelID, newInfo); err != nil {
 			c.logger.Warn("failed to save found message info", "error", err)
-		}
-
-		// Update the found message with current content
-		if err := c.discord.UpdateMessage(ctx, channelID, foundMsgID, content); err != nil {
-			c.logger.Warn("failed to update found message", "error", err)
 		}
 
 		c.trackTaggedUsers(params)
@@ -628,7 +666,7 @@ func (c *Coordinator) processDMForUser(
 
 	// Idempotency: skip if state unchanged
 	if dmExists && dmInfo.LastState == string(prState) {
-		c.logger.Debug("DM skipped - state unchanged",
+		c.logger.Info("DM skipped - state unchanged",
 			"user", username,
 			"pr_url", prURL,
 			"state", prState)
@@ -639,7 +677,7 @@ func (c *Coordinator) processDMForUser(
 	if dmExists && dmInfo.ChannelID != "" && dmInfo.MessageID != "" {
 		// Content comparison: skip if message unchanged
 		if dmInfo.MessageText == newMessage {
-			c.logger.Debug("DM content unchanged, skipping update",
+			c.logger.Info("DM content unchanged, skipping update",
 				"user", username,
 				"pr_url", prURL)
 			return
@@ -729,7 +767,7 @@ func (c *Coordinator) updateAllDMsForClosedPR(
 	// Get all users who received DMs for this PR
 	userIDs := c.store.ListDMUsers(ctx, prURL)
 	if len(userIDs) == 0 {
-		c.logger.Debug("no DM recipients found for closed PR",
+		c.logger.Info("no DM recipients found for closed PR",
 			"pr_url", prURL,
 			"state", prState)
 		// Also cancel any pending DMs
@@ -946,6 +984,12 @@ func (c *Coordinator) PollAndReconcile(ctx context.Context) {
 
 // reconcilePR checks a single PR's state and updates Discord if needed.
 func (c *Coordinator) reconcilePR(ctx context.Context, pr PRSearchResult) {
+	// Check if already processed at this update time
+	pollKey := fmt.Sprintf("poll:%s:%s", pr.URL, pr.UpdatedAt.Format(time.RFC3339))
+	if c.store.WasProcessed(ctx, pollKey) {
+		return // Already processed this PR at this update time
+	}
+
 	// Create a synthetic event for processing
 	event := SprinklerEvent{
 		Type:       "poll",
@@ -954,24 +998,17 @@ func (c *Coordinator) reconcilePR(ctx context.Context, pr PRSearchResult) {
 		DeliveryID: fmt.Sprintf("poll-%s-%d", pr.URL, time.Now().UnixNano()),
 	}
 
-	// Use a unique event key for polling to avoid dedup conflicts with real events
-	// but still prevent duplicate poll processing
-	pollKey := fmt.Sprintf("poll:%s:%s", pr.URL, pr.UpdatedAt.Format(time.RFC3339))
-	if c.store.WasProcessed(ctx, pollKey) {
-		return // Already processed this PR at this update time
-	}
-
 	// Process the event (reuses all the normal event processing logic)
 	if err := c.processEventSync(ctx, event); err != nil {
 		c.logger.Warn("failed to reconcile PR",
 			"url", pr.URL,
 			"error", err)
-		return
+		return // Don't mark as processed - allow retry next cycle
 	}
 
-	// Mark as processed
+	// Mark as processed only after successful processing
 	if err := c.store.MarkProcessed(ctx, pollKey, eventDeduplicationTTL); err != nil {
-		c.logger.Warn("failed to mark poll processed", "error", err)
+		c.logger.Warn("failed to mark poll event as processed", "error", err, "pr_url", pr.URL)
 	}
 }
 
