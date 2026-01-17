@@ -71,11 +71,6 @@ func StateEmoji(state PRState) string {
 	}
 }
 
-// StateParam returns the URL state parameter suffix for a PR state.
-func StateParam(state PRState) string {
-	return "?st=" + string(state)
-}
-
 // StateText returns the human-readable text label for a PR state.
 // Returns empty string for states that don't need text labels.
 func StateText(state PRState) string {
@@ -99,14 +94,14 @@ func StateText(state PRState) string {
 
 // ChannelMessageParams contains parameters for formatting a channel message.
 type ChannelMessageParams struct {
-	ActionUsers []ActionUser // Users who need to take action
 	Owner       string
 	Repo        string
 	Title       string
 	Author      string
 	State       PRState
 	PRURL       string
-	ChannelName string // If provided and matches Repo (case-insensitive), use short form #123
+	ChannelName string
+	ActionUsers []ActionUser
 	Number      int
 }
 
@@ -132,7 +127,7 @@ func ChannelMessage(p ChannelMessageParams) string {
 	if p.ChannelName != "" && strings.EqualFold(p.ChannelName, p.Repo) {
 		prRef = fmt.Sprintf("#%d", p.Number)
 	}
-	sb.WriteString(fmt.Sprintf("[%s](%s%s)", prRef, p.PRURL, StateParam(p.State)))
+	sb.WriteString(fmt.Sprintf("[%s](%s?st=%s)", prRef, p.PRURL, p.State))
 
 	// Title with dot delimiter
 	sb.WriteString(" · ")
@@ -197,11 +192,6 @@ func ForumThreadTitle(repo string, number int, title string) string {
 	return prefix + Truncate(title, maxTitleLen)
 }
 
-// ForumThreadContent formats the content for a forum thread starter message.
-func ForumThreadContent(p ChannelMessageParams) string {
-	return ChannelMessage(p)
-}
-
 // DMMessage formats a DM notification.
 func DMMessage(p ChannelMessageParams, action string) string {
 	emoji := StateEmoji(p.State)
@@ -231,16 +221,16 @@ func DMMessage(p ChannelMessageParams, action string) string {
 
 // StateAnalysisParams contains parameters for StateFromAnalysis.
 type StateAnalysisParams struct {
+	WorkflowState      string
+	ChecksFailing      int
+	ChecksPending      int
+	ChecksWaiting      int
+	UnresolvedComments int
 	Merged             bool
 	Closed             bool
 	Draft              bool
 	MergeConflict      bool
 	Approved           bool
-	ChecksFailing      int
-	ChecksPending      int
-	ChecksWaiting      int
-	UnresolvedComments int
-	WorkflowState      string
 }
 
 // StateFromAnalysis determines PRState from Turn API analysis.

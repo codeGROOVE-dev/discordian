@@ -28,16 +28,16 @@ type DMInfo struct {
 
 // PendingDM represents a scheduled DM notification.
 type PendingDM struct {
+	SendAt      time.Time `json:"send_at"`
+	CreatedAt   time.Time `json:"created_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
 	ID          string    `json:"id"`
 	UserID      string    `json:"user_id"`
 	PRURL       string    `json:"pr_url"`
 	MessageText string    `json:"message_text"`
-	SendAt      time.Time `json:"send_at"`
-	CreatedAt   time.Time `json:"created_at"`
 	GuildID     string    `json:"guild_id"`
 	Org         string    `json:"org"`
-	RetryCount  int       `json:"retry_count"` // Number of failed attempts
-	ExpiresAt   time.Time `json:"expires_at"`  // TTL for old DMs
+	RetryCount  int       `json:"retry_count"`
 }
 
 // DailyReportInfo tracks daily report state for a user.
@@ -47,6 +47,8 @@ type DailyReportInfo struct {
 }
 
 // Store provides persistent state operations.
+//
+//nolint:interfacebloat // Store handles threads, DMs, events, reports, and cleanup
 type Store interface {
 	// Thread/post tracking - maps PR to Discord thread/message
 	Thread(ctx context.Context, owner, repo string, number int, channelID string) (ThreadInfo, bool)

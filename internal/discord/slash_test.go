@@ -1,9 +1,12 @@
 package discord
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bwmarrin/discordgo"
 
 	"github.com/codeGROOVE-dev/discordian/internal/format"
 )
@@ -38,6 +41,45 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
+// Helper functions for test assertions
+func findEmbedField(fields []*discordgo.MessageEmbedField, nameSubstring string) *discordgo.MessageEmbedField {
+	for _, field := range fields {
+		if field.Name == nameSubstring || strings.Contains(field.Name, nameSubstring) {
+			// Prefer exact match
+			if field.Name == nameSubstring {
+				return field
+			}
+		}
+	}
+	// Return partial match if no exact match
+	for _, field := range fields {
+		if strings.Contains(field.Name, nameSubstring) {
+			return field
+		}
+	}
+	return nil
+}
+
+func assertFieldExists(t *testing.T, fields []*discordgo.MessageEmbedField, nameSubstring, errMsg string) *discordgo.MessageEmbedField {
+	t.Helper()
+	field := findEmbedField(fields, nameSubstring)
+	if field == nil {
+		t.Error(errMsg)
+	}
+	return field
+}
+
+func assertFieldContains(t *testing.T, field *discordgo.MessageEmbedField, substring, errMsg string) {
+	t.Helper()
+	if field == nil {
+		t.Error(errMsg + " (field not found)")
+		return
+	}
+	if !strings.Contains(field.Value, substring) {
+		t.Errorf("%s (got: %q)", errMsg, field.Value)
+	}
+}
+
 func TestFormatDashboardEmbed(t *testing.T) {
 	handler := &SlashCommandHandler{}
 
@@ -51,19 +93,8 @@ func TestFormatDashboardEmbed(t *testing.T) {
 		if embed.Color != 0x57F287 {
 			t.Errorf("Color = %x, want Discord green 0x57F287 (no PRs)", embed.Color)
 		}
-		// Should have dashboard link in Links field
-		hasLinksField := false
-		for _, field := range embed.Fields {
-			if strings.Contains(field.Name, "Links") {
-				hasLinksField = true
-				if !strings.Contains(field.Value, "Personal") {
-					t.Error("Links field should contain Personal dashboard link")
-				}
-			}
-		}
-		if !hasLinksField {
-			t.Error("Should have Links field with dashboard link")
-		}
+		linksField := assertFieldExists(t, embed.Fields, "Links", "Should have Links field with dashboard link")
+		assertFieldContains(t, linksField, "Personal", "Links field should contain Personal dashboard link")
 	})
 
 	t.Run("with incoming PRs", func(t *testing.T) {
@@ -80,27 +111,13 @@ func TestFormatDashboardEmbed(t *testing.T) {
 		}
 		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		// Should be yellow when there are PRs to review
 		if embed.Color != 0xFEE75C {
 			t.Errorf("Color = %x, want Discord yellow 0xFEE75C (has PRs)", embed.Color)
 		}
 
-		// Should have Reviewing field
-		hasReviewingField := false
-		for _, field := range embed.Fields {
-			if strings.Contains(field.Name, "Reviewing") {
-				hasReviewingField = true
-				if !strings.Contains(field.Value, "myrepo#42") {
-					t.Errorf("Field value should contain PR reference")
-				}
-				if !strings.Contains(field.Value, "alice") {
-					t.Errorf("Field value should contain author name")
-				}
-			}
-		}
-		if !hasReviewingField {
-			t.Error("Should have Reviewing field for incoming PRs")
-		}
+		reviewingField := assertFieldExists(t, embed.Fields, "Reviewing", "Should have Reviewing field for incoming PRs")
+		assertFieldContains(t, reviewingField, "myrepo#42", "Field value should contain PR reference")
+		assertFieldContains(t, reviewingField, "alice", "Field value should contain author name")
 	})
 
 	t.Run("with outgoing PRs", func(t *testing.T) {
@@ -116,19 +133,8 @@ func TestFormatDashboardEmbed(t *testing.T) {
 		}
 		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		// Should have Your PRs field
-		hasYourPRsField := false
-		for _, field := range embed.Fields {
-			if strings.Contains(field.Name, "Your PRs") {
-				hasYourPRsField = true
-				if !strings.Contains(field.Value, "myrepo#99") {
-					t.Errorf("Field value should contain PR reference")
-				}
-			}
-		}
-		if !hasYourPRsField {
-			t.Error("Should have Your PRs field for outgoing PRs")
-		}
+		yourPRsField := assertFieldExists(t, embed.Fields, "Your PRs", "Should have Your PRs field for outgoing PRs")
+		assertFieldContains(t, yourPRsField, "myrepo#99", "Field value should contain PR reference")
 	})
 
 	t.Run("with both sections", func(t *testing.T) {
@@ -142,7 +148,6 @@ func TestFormatDashboardEmbed(t *testing.T) {
 		}
 		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		// Should have Reviewing, Your PRs, and Links fields
 		if len(embed.Fields) != 3 {
 			t.Fatalf("Fields = %d, want 3 (Reviewing, Your PRs, Links)", len(embed.Fields))
 		}
@@ -157,7 +162,6 @@ func TestFormatDashboardEmbed(t *testing.T) {
 		}
 		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", "")
 
-		// Title should be truncated to 50 chars
 		if strings.Contains(embed.Fields[0].Value, longTitle) {
 			t.Error("Long title should be truncated")
 		}
@@ -171,19 +175,8 @@ func TestFormatDashboardEmbed(t *testing.T) {
 		orgLinks := "\n\n**Organization Dashboards:**\n• myorg: [View Dashboard](https://example.com/orgs/myorg)\n"
 		embed := handler.formatDashboardEmbed(report, "https://dash.example.com", orgLinks)
 
-		// Should include org links in Links field
-		hasLinksField := false
-		for _, field := range embed.Fields {
-			if strings.Contains(field.Name, "Links") {
-				hasLinksField = true
-				if !strings.Contains(field.Value, "myorg") {
-					t.Error("Links field should include org links")
-				}
-			}
-		}
-		if !hasLinksField {
-			t.Error("Should have Links field with org links")
-		}
+		linksField := assertFieldExists(t, embed.Fields, "Links", "Should have Links field with org links")
+		assertFieldContains(t, linksField, "myorg", "Links field should include org links")
 	})
 }
 
@@ -389,20 +382,21 @@ func TestFormatUserMappingsEmbed(t *testing.T) {
 		// Should have Config field
 		hasConfigField := false
 		for _, field := range embed.Fields {
-			if strings.Contains(field.Name, "Config") && strings.Contains(field.Name, "2") {
-				hasConfigField = true
-				if !strings.Contains(field.Value, "alice") {
-					t.Error("Field value should contain alice")
-				}
-				if !strings.Contains(field.Value, "bob") {
-					t.Error("Field value should contain bob")
-				}
-				if !strings.Contains(field.Value, "123456789") {
-					t.Error("Field value should contain Discord ID")
-				}
-				if !strings.Contains(field.Value, "myorg") {
-					t.Error("Field value should contain org for alice")
-				}
+			if !strings.Contains(field.Name, "Config") || !strings.Contains(field.Name, "2") {
+				continue
+			}
+			hasConfigField = true
+			if !strings.Contains(field.Value, "alice") {
+				t.Error("Field value should contain alice")
+			}
+			if !strings.Contains(field.Value, "bob") {
+				t.Error("Field value should contain bob")
+			}
+			if !strings.Contains(field.Value, "123456789") {
+				t.Error("Field value should contain Discord ID")
+			}
+			if !strings.Contains(field.Value, "myorg") {
+				t.Error("Field value should contain org for alice")
 			}
 		}
 		if !hasConfigField {
@@ -550,4 +544,194 @@ func TestFormatChannelMappingsEmbed(t *testing.T) {
 			t.Errorf("Field name should contain '3 repos', got %q", field.Name)
 		}
 	})
+}
+
+func TestSlashCommandHandler_SetDailyReportGetter(t *testing.T) {
+	handler := NewSlashCommandHandler(nil, nil)
+
+	if handler.dailyReportGetter != nil {
+		t.Error("dailyReportGetter should be nil initially")
+	}
+
+	getter := &mockDailyReportGetter{}
+	handler.SetDailyReportGetter(getter)
+
+	if handler.dailyReportGetter == nil {
+		t.Error("SetDailyReportGetter() should set the dailyReportGetter")
+	}
+}
+
+func TestSlashCommandHandler_SetUserMapGetter(t *testing.T) {
+	handler := NewSlashCommandHandler(nil, nil)
+
+	if handler.userMapGetter != nil {
+		t.Error("userMapGetter should be nil initially")
+	}
+
+	getter := &mockUserMapGetter{}
+	handler.SetUserMapGetter(getter)
+
+	if handler.userMapGetter == nil {
+		t.Error("SetUserMapGetter() should set the userMapGetter")
+	}
+}
+
+func TestSlashCommandHandler_SetChannelMapGetter(t *testing.T) {
+	handler := NewSlashCommandHandler(nil, nil)
+
+	if handler.channelMapGetter != nil {
+		t.Error("channelMapGetter should be nil initially")
+	}
+
+	getter := &mockChannelMapGetter{}
+	handler.SetChannelMapGetter(getter)
+
+	if handler.channelMapGetter == nil {
+		t.Error("SetChannelMapGetter() should set the channelMapGetter")
+	}
+}
+
+func TestFormatDailyReportEmbed(t *testing.T) {
+	handler := &SlashCommandHandler{}
+
+	t.Run("report sent successfully", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         true,
+			LastSentAt:         time.Now().Add(-10 * time.Hour),
+			NextEligibleAt:     time.Now().Add(10 * time.Hour),
+			HoursSinceLastSent: 10.5,
+			Eligible:           true,
+			Reason:             "Report sent successfully",
+			IncomingPRCount:    5,
+			OutgoingPRCount:    3,
+			ReportSent:         true,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		if embed.Color != 0x57F287 {
+			t.Errorf("Color = %x, want Discord green 0x57F287 (sent)", embed.Color)
+		}
+
+		if embed.Title != "📊 Daily Report Status" {
+			t.Errorf("Title = %q, want '📊 Daily Report Status'", embed.Title)
+		}
+
+		expectedFieldCount := 7
+		if len(embed.Fields) != expectedFieldCount {
+			t.Errorf("Fields = %d, want %d", len(embed.Fields), expectedFieldCount)
+		}
+
+		userStatusField := assertFieldExists(t, embed.Fields, "User Status", "Should have User Status field")
+		assertFieldContains(t, userStatusField, "🟢 Online", "User Status should show online")
+
+		prsFoundField := assertFieldExists(t, embed.Fields, "PRs Found", "Should have PRs Found field")
+		assertFieldContains(t, prsFoundField, "📥 5 incoming", "PRs Found should show 5 incoming")
+		assertFieldContains(t, prsFoundField, "📤 3 outgoing", "PRs Found should show 3 outgoing")
+
+		statusField := assertFieldExists(t, embed.Fields, "Status", "Should have Status field")
+		assertFieldContains(t, statusField, "✅", "Status should show success checkmark")
+		assertFieldContains(t, statusField, "Report sent successfully", "Status should show reason")
+	})
+
+	t.Run("report not sent - rate limited", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         true,
+			LastSentAt:         time.Now().Add(-5 * time.Hour),
+			NextEligibleAt:     time.Now().Add(15 * time.Hour),
+			HoursSinceLastSent: 5.0,
+			Eligible:           false,
+			Reason:             "Rate limited: only 5.0 hours since last report (need 20)",
+			IncomingPRCount:    2,
+			OutgoingPRCount:    1,
+			ReportSent:         false,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		if embed.Color != 0xED4245 {
+			t.Errorf("Color = %x, want Discord red 0xED4245 (not eligible)", embed.Color)
+		}
+
+		statusField := assertFieldExists(t, embed.Fields, "Status", "Should have Status field")
+		assertFieldContains(t, statusField, "❌", "Status should show error X")
+		assertFieldContains(t, statusField, "Not sent", "Status should show 'Not sent'")
+		assertFieldContains(t, statusField, "Rate limited", "Status should show rate limit reason")
+	})
+
+	t.Run("eligible but not sent", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         true,
+			LastSentAt:         time.Now().Add(-25 * time.Hour),
+			NextEligibleAt:     time.Now().Add(-5 * time.Hour),
+			HoursSinceLastSent: 25.0,
+			Eligible:           true,
+			Reason:             "Test reason",
+			IncomingPRCount:    0,
+			OutgoingPRCount:    0,
+			ReportSent:         false,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		if embed.Color != 0xFEE75C {
+			t.Errorf("Color = %x, want Discord yellow 0xFEE75C (eligible)", embed.Color)
+		}
+	})
+
+	t.Run("user offline", func(t *testing.T) {
+		debug := &DailyReportDebug{
+			UserOnline:         false,
+			LastSentAt:         time.Time{},
+			HoursSinceLastSent: 0,
+			Eligible:           false,
+			Reason:             "User is offline",
+			IncomingPRCount:    1,
+			OutgoingPRCount:    0,
+			ReportSent:         false,
+		}
+
+		embed := handler.formatDailyReportEmbed(debug)
+
+		userStatusField := assertFieldExists(t, embed.Fields, "User Status", "Should have User Status field")
+		assertFieldContains(t, userStatusField, "🔴 Offline", "User Status should show offline")
+
+		lastSentField := assertFieldExists(t, embed.Fields, "Last Report Sent", "Should have Last Report Sent field")
+		assertFieldContains(t, lastSentField, "Never", "Last Sent should show 'Never'")
+	})
+}
+
+// Mock implementations for testing
+
+type mockDailyReportGetter struct {
+	debug *DailyReportDebug
+	err   error
+}
+
+func (m *mockDailyReportGetter) DailyReport(_ context.Context, _, _ string, _ bool) (*DailyReportDebug, error) {
+	return m.debug, m.err
+}
+
+type mockUserMapGetter struct {
+	mappings *UserMappings
+	err      error
+}
+
+func (m *mockUserMapGetter) UserMappings(_ context.Context, _ string) (*UserMappings, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.mappings, nil
+}
+
+type mockChannelMapGetter struct {
+	mappings *ChannelMappings
+	err      error
+}
+
+func (m *mockChannelMapGetter) ChannelMappings(_ context.Context, _ string) (*ChannelMappings, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.mappings, nil
 }

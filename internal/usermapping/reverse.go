@@ -9,7 +9,7 @@ import (
 
 // OrgConfig represents an org's config with user mappings.
 type OrgConfig interface {
-	GetUsers() map[string]string
+	UserMappings() map[string]string
 }
 
 // ReverseConfigLookup defines the interface for reverse config-based user lookup.
@@ -24,8 +24,8 @@ type ReverseMapper struct {
 }
 
 type reverseEntry struct {
-	githubUsername string
 	cachedAt       time.Time
+	githubUsername string
 }
 
 // NewReverseMapper creates a new reverse mapper.
@@ -77,7 +77,7 @@ func (m *ReverseMapper) GitHubUsername(ctx context.Context, discordUserID string
 		}
 
 		// Search for matching Discord user ID
-		users := orgCfg.GetUsers()
+		users := orgCfg.UserMappings()
 		totalUsersChecked += len(users)
 
 		slog.Debug("checking org user mappings",
