@@ -9,6 +9,8 @@ The Discord integration for [reviewGOOSE](https://codegroove.dev/reviewgoose/) �
 - Creates Discord threads for new PRs (forum channels) or posts in text channels
 - Smart notifications: Delays DMs if user already notified in channel
 - Channel auto-discovery: repos automatically map to same-named channels
+- **Self-service user linking**: Link your GitHub account with `/goose github-user` command
+- **Smart user matching**: Automatically matches by username, display name, or server nickname
 - Configurable notification settings via YAML
 - Activity-based reports when you come online
 - Reliable delivery with deduplication
@@ -44,11 +46,11 @@ Create `.codeGROOVE/discord.yaml`:
 
 ```yaml
 global:
-  guild_id: "YOUR_DISCORD_SERVER_ID"
+  guild_id: YOUR_DISCORD_SERVER_ID
 
 # Optional: Add explicit user mappings if GitHub/Discord usernames differ
 # users:
-#   github-username: "discord-user-id"
+#   github-username: discord-user-id
 ```
 
 ### 5. Add the Bot to Your Server
@@ -70,12 +72,12 @@ Full configuration options for `.codeGROOVE/discord.yaml`:
 
 ```yaml
 global:
-  guild_id: "1234567890123456789"
+  guild_id: 1234567890123456789
   reminder_dm_delay: 65  # Minutes to wait before sending DM (default: 65, 0 = disabled)
 
 users:
-  alice: "111111111111111111"  # GitHub username → Discord user ID
-  bob: "222222222222222222"
+  alice: 111111111111111111    # GitHub username → Discord user ID
+  bob: discord-bob-username    # GitHub username → Discord username
   # Unmapped users: bot attempts username match in guild
 
 channels:
@@ -110,24 +112,33 @@ channels:
 
 ## User Mapping
 
-The bot maps GitHub → Discord users using a 3-tier lookup system:
+The bot maps GitHub → Discord users using a 4-tier lookup system:
 
-### 1. Explicit Config Mapping
+### 1. Explicit Config Mapping (Highest Priority)
 Checks the `users:` section in `discord.yaml`. Values can be:
 - Discord numeric ID: `"111111111111111111"`
 - Discord username: Bot will look it up in the guild
 
-### 2. Automatic Username Match
-Searches the Discord guild for the GitHub username using progressive matching. At each tier, checks both:
+### 2. Self-Service Linking
+Users can link their own accounts with `/goose github-user <username>`. Mappings are stored persistently and take priority over automatic discovery.
+
+Example:
+```
+/goose github-user octocat
+```
+
+### 3. Automatic Username Match
+Searches the Discord guild for the GitHub username using progressive matching. At each tier, checks:
 - Discord **Username** (e.g., `@johndoe`)
 - Discord **Display Name** (the name shown in the member list)
+- Discord **Server Nickname** (the custom name set for this server)
 
 Matching tiers:
-- **Tier 1**: Exact match (checks Username first, then Display Name)
+- **Tier 1**: Exact match (checks Username, Display Name, then Nickname)
 - **Tier 2**: Case-insensitive match (e.g., `JohnDoe` matches `johndoe`)
 - **Tier 3**: Prefix match (e.g., `john` matches `johnsmith`) - only if unambiguous (exactly one match)
 
-### 3. Fallback
+### 4. Fallback
 If no match is found, mentions GitHub username as plain text (e.g., `octocat` instead of `@octocat`)
 
 ---
@@ -136,12 +147,16 @@ If no match is found, mentions GitHub username as plain text (e.g., `octocat` in
 
 **How to get Discord User IDs**: With Developer Mode enabled, right-click any username → Copy User ID
 
+**Pro tip**: Set your Discord server nickname to match your GitHub username for automatic matching!
+
 ## Slash Commands
 
-- `/goose status` - Show bot connection status
-- `/goose report` - Get your personal PR report
-- `/goose dashboard` - Link to web dashboard
-- `/goose help` - Show help
+- `/goose status` - Show bot connection status and statistics
+- `/goose dash` - Get your personal PR report and dashboard links
+- `/goose github-user <username>` - Link your Discord account to a GitHub username
+- `/goose users` - Show all GitHub ↔ Discord user mappings
+- `/goose channels` - Show repository to channel mappings
+- `/goose help` - Show help information
 
 ## Notification Behavior
 

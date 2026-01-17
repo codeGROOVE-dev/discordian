@@ -77,7 +77,11 @@ func TestGuildManager_RemoveClient(t *testing.T) {
 	manager := NewGuildManager(nil)
 	// Create a session (it won't connect in tests)
 	session := &discordgo.Session{}
-	client := &Client{guildID: "test-guild", session: session}
+	client := &Client{
+		guildID:     "test-guild",
+		session:     &sessionAdapter{Session: session},
+		realSession: session,
+	}
 
 	// Register a client
 	manager.RegisterClient("test-guild", client)

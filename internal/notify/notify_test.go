@@ -110,6 +110,18 @@ func (m *mockStore) SaveDailyReportInfo(_ context.Context, _ string, _ state.Dai
 	return nil
 }
 
+func (m *mockStore) UserMapping(_ context.Context, _, _ string) (state.UserMappingInfo, bool) {
+	return state.UserMappingInfo{}, false
+}
+
+func (m *mockStore) SaveUserMapping(_ context.Context, _ string, _ state.UserMappingInfo) error {
+	return nil
+}
+
+func (m *mockStore) ListUserMappings(_ context.Context, _ string) []state.UserMappingInfo {
+	return nil
+}
+
 // mockDMSender implements DiscordDMSender for testing
 type mockDMSender struct {
 	sentDMs   []sentDM

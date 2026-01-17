@@ -44,7 +44,7 @@ func TestMapper_DiscordID(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", configLookup, discordLookup)
+	mapper := New("testorg", configLookup, discordLookup, nil, "test-guild")
 
 	tests := []struct {
 		name           string
@@ -98,7 +98,7 @@ func TestMapper_DiscordID_ConfigOverridesDiscord(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", configLookup, discordLookup)
+	mapper := New("testorg", configLookup, discordLookup, nil, "test-guild")
 
 	// Config should take priority
 	got := mapper.DiscordID(ctx, "alice")
@@ -116,7 +116,7 @@ func TestMapper_DiscordID_Caching(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", nil, discordLookup)
+	mapper := New("testorg", nil, discordLookup, nil, "test-guild")
 
 	// First call - should hit Discord lookup
 	id1 := mapper.DiscordID(ctx, "bob")
@@ -143,7 +143,7 @@ func TestMapper_Mention(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", configLookup, nil)
+	mapper := New("testorg", configLookup, nil, nil, "test-guild")
 
 	tests := []struct {
 		name           string
@@ -181,7 +181,7 @@ func TestMapper_ClearCache(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", configLookup, nil)
+	mapper := New("testorg", configLookup, nil, nil, "test-guild")
 
 	// Populate cache
 	mapper.DiscordID(ctx, "alice")
@@ -207,7 +207,7 @@ func TestMapper_NilLookups(t *testing.T) {
 	ctx := context.Background()
 
 	// Both lookups nil
-	mapper := New("testorg", nil, nil)
+	mapper := New("testorg", nil, nil, nil, "test-guild")
 
 	got := mapper.DiscordID(ctx, "anyone")
 	if got != "" {
@@ -229,7 +229,7 @@ func TestMapper_DiscordID_CacheTTL(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", nil, discordLookup)
+	mapper := New("testorg", nil, discordLookup, nil, "test-guild")
 
 	// First call - populates cache
 	id1 := mapper.DiscordID(ctx, "bob")
@@ -316,7 +316,7 @@ func TestMapper_ConfigUsernameResolution(t *testing.T) {
 				users: tt.discordUsers,
 			}
 
-			mapper := New("testorg", configLookup, discordLookup)
+			mapper := New("testorg", configLookup, discordLookup, nil, "test-guild")
 
 			got := mapper.DiscordID(ctx, tt.githubUsername)
 			if got != tt.wantID {
@@ -342,7 +342,7 @@ func TestMapper_ConfigUsernameResolution_Mention(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", configLookup, discordLookup)
+	mapper := New("testorg", configLookup, discordLookup, nil, "test-guild")
 
 	got := mapper.Mention(ctx, "alice")
 	want := "<@111111111111111111>"
@@ -362,7 +362,7 @@ func TestMapper_ExportCache(t *testing.T) {
 		},
 	}
 
-	mapper := New("testorg", configLookup, nil)
+	mapper := New("testorg", configLookup, nil, nil, "test-guild")
 
 	// Populate cache
 	mapper.DiscordID(ctx, "alice")

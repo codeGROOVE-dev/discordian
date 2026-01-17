@@ -20,6 +20,7 @@ const (
 	dailyReportTTL = 36 * time.Hour      // Slightly over 1 day to handle timezone edge cases
 	pendingDMTTL   = 4 * time.Hour       // Max time a DM can be pending
 	claimTTL       = 10 * time.Second    // Short TTL for claims - just enough to post message
+	userMappingTTL = 30 * 24 * time.Hour // 30 days - user mappings rarely change
 )
 
 // pendingDMQueue stores all pending DMs in a single persisted value.
@@ -44,14 +45,16 @@ type dmUserList struct {
 //   - discordian-pending: Pending DM queue
 //   - discordian-events: Event deduplication (persisted for cross-instance safety)
 //   - discordian-claims: Distributed claims (persisted for cross-instance coordination)
+//   - discordian-usermappings: GitHub username to Discord user ID mappings
 type FidoStore struct {
 	threads      *fido.TieredCache[string, ThreadInfo]
 	dmInfo       *fido.TieredCache[string, DMInfo]
 	dmUserLists  *fido.TieredCache[string, dmUserList] // Persisted: prURL -> user IDs
 	dailyReports *fido.TieredCache[string, DailyReportInfo]
 	pendingDMs   *fido.TieredCache[string, pendingDMQueue]
-	events       *fido.TieredCache[string, time.Time] // Persisted for cross-instance dedup
-	claims       *fido.TieredCache[string, time.Time] // Persisted for cross-instance claim coordination
+	events       *fido.TieredCache[string, time.Time]       // Persisted for cross-instance dedup
+	claims       *fido.TieredCache[string, time.Time]       // Persisted for cross-instance claim coordination
+	userMappings *fido.TieredCache[string, UserMappingInfo] // Persisted: guildID:gitHubUsername -> UserMappingInfo
 
 	pendingMu sync.Mutex // Serializes pending DM operations
 }
@@ -60,13 +63,14 @@ type FidoStore struct {
 type FidoStoreOption func(*fidoStoreOptions)
 
 type fidoStoreOptions struct {
-	threadStore  fido.Store[string, ThreadInfo]
-	dmStore      fido.Store[string, DMInfo]
-	dmUserStore  fido.Store[string, dmUserList]
-	reportStore  fido.Store[string, DailyReportInfo]
-	pendingStore fido.Store[string, pendingDMQueue]
-	eventStore   fido.Store[string, time.Time]
-	claimStore   fido.Store[string, time.Time]
+	threadStore      fido.Store[string, ThreadInfo]
+	dmStore          fido.Store[string, DMInfo]
+	dmUserStore      fido.Store[string, dmUserList]
+	reportStore      fido.Store[string, DailyReportInfo]
+	pendingStore     fido.Store[string, pendingDMQueue]
+	eventStore       fido.Store[string, time.Time]
+	claimStore       fido.Store[string, time.Time]
+	userMappingStore fido.Store[string, UserMappingInfo]
 }
 
 // WithThreadStore sets a custom store for thread data.
@@ -102,6 +106,11 @@ func WithEventStore(s fido.Store[string, time.Time]) FidoStoreOption {
 // WithClaimStore sets a custom store for claim data.
 func WithClaimStore(s fido.Store[string, time.Time]) FidoStoreOption {
 	return func(o *fidoStoreOptions) { o.claimStore = s }
+}
+
+// WithUserMappingStore sets a custom store for user mapping data.
+func WithUserMappingStore(s fido.Store[string, UserMappingInfo]) FidoStoreOption {
+	return func(o *fidoStoreOptions) { o.userMappingStore = s }
 }
 
 // NewFidoStore creates a new fido-backed store.
@@ -177,6 +186,15 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		}
 	}
 
+	userMappingStore := o.userMappingStore
+	if userMappingStore == nil {
+		var err error
+		userMappingStore, err = cloudrun.New[string, UserMappingInfo](ctx, "discordian-usermappings")
+		if err != nil {
+			return nil, fmt.Errorf("create user mapping store: %w", err)
+		}
+	}
+
 	threads, err := fido.NewTiered(threadStore, fido.TTL(threadTTL))
 	if err != nil {
 		return nil, fmt.Errorf("create thread cache: %w", err)
@@ -212,6 +230,11 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		return nil, fmt.Errorf("create claim cache: %w", err)
 	}
 
+	userMappings, err := fido.NewTiered(userMappingStore, fido.TTL(userMappingTTL))
+	if err != nil {
+		return nil, fmt.Errorf("create user mapping cache: %w", err)
+	}
+
 	slog.Info("initialized fido store")
 	return &FidoStore{
 		threads:      threads,
@@ -221,6 +244,7 @@ func NewFidoStore(ctx context.Context, opts ...FidoStoreOption) (*FidoStore, err
 		pendingDMs:   pendingDMs,
 		events:       events,
 		claims:       claims,
+		userMappings: userMappings,
 	}, nil
 }
 
@@ -513,6 +537,46 @@ func (s *FidoStore) Cleanup(ctx context.Context) error {
 	return nil
 }
 
+// UserMapping retrieves user mapping info for a GitHub username in a guild.
+func (s *FidoStore) UserMapping(ctx context.Context, guildID, gitHubUsername string) (UserMappingInfo, bool) {
+	key := fmt.Sprintf("%s:%s", guildID, gitHubUsername)
+	info, found, err := s.userMappings.Get(ctx, key)
+	if err != nil {
+		slog.Debug("user mapping lookup error", "key", key, "error", err)
+		return UserMappingInfo{}, false
+	}
+	return info, found
+}
+
+// SaveUserMapping stores user mapping info for a GitHub username.
+func (s *FidoStore) SaveUserMapping(ctx context.Context, guildID string, info UserMappingInfo) error {
+	key := fmt.Sprintf("%s:%s", guildID, info.GitHubUsername)
+	info.CreatedAt = time.Now()
+	info.GuildID = guildID
+
+	if err := s.userMappings.Set(ctx, key, info); err != nil {
+		return fmt.Errorf("save user mapping: %w", err)
+	}
+
+	slog.Info("saved user mapping",
+		"guild_id", guildID,
+		"github_username", info.GitHubUsername,
+		"discord_user_id", info.DiscordUserID)
+
+	return nil
+}
+
+// ListUserMappings returns all user mappings for a guild.
+func (*FidoStore) ListUserMappings(_ context.Context, guildID string) []UserMappingInfo {
+	// Note: Fido TieredCache doesn't have a List or Scan method,
+	// so we can't efficiently list all mappings without scanning all keys.
+	// For now, return empty slice - this should be populated from usermapping.Mapper cache
+	// or we need to implement a separate index.
+	slog.Warn("ListUserMappings not fully implemented for FidoStore",
+		"guild_id", guildID)
+	return []UserMappingInfo{}
+}
+
 // Close releases resources.
 func (s *FidoStore) Close() error {
 	var errs []error
@@ -537,6 +601,9 @@ func (s *FidoStore) Close() error {
 	}
 	if err := s.claims.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close claims: %w", err))
+	}
+	if err := s.userMappings.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close userMappings: %w", err))
 	}
 
 	if len(errs) > 0 {

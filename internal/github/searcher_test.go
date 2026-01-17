@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -364,6 +365,175 @@ func TestSearchPRs(t *testing.T) {
 	})
 }
 
-// Note: ListOpenPRs, ListClosedPRs, ListAuthoredPRs, and ListReviewRequestedPRs
-// are difficult to test without an actual AppClient or refactoring to use interfaces.
-// These methods are tested indirectly through integration tests.
+// TestListOpenPRs tests listing open PRs
+func TestListOpenPRs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful search", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			response := &github.IssuesSearchResult{
+				Total: github.Int(1),
+				Issues: []*github.Issue{
+					NewMockPRIssue("testowner", "testrepo", 123, "Test PR"),
+				},
+			}
+			writeJSONResponse(t, w, response)
+		}))
+		defer server.Close()
+
+		client := setupTestGitHubClient(t, server.URL)
+		mockAppClient := &MockAppClient{Client: client}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		results, err := searcher.ListOpenPRs(ctx, "test-org", 24)
+		if err != nil {
+			t.Fatalf("ListOpenPRs() error = %v, want nil", err)
+		}
+
+		if len(results) != 1 {
+			t.Errorf("ListOpenPRs() returned %d results, want 1", len(results))
+		}
+	})
+
+	t.Run("client error", func(t *testing.T) {
+		mockAppClient := &MockAppClient{
+			ClientError: fmt.Errorf("no installation found"),
+		}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		_, err := searcher.ListOpenPRs(ctx, "test-org", 24)
+		if err == nil {
+			t.Error("ListOpenPRs() error = nil, want error")
+		}
+	})
+}
+
+// TestListClosedPRs tests listing closed PRs
+func TestListClosedPRs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful search", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			response := &github.IssuesSearchResult{
+				Total: github.Int(1),
+				Issues: []*github.Issue{
+					NewMockPRIssue("testowner", "testrepo", 456, "Closed PR"),
+				},
+			}
+			writeJSONResponse(t, w, response)
+		}))
+		defer server.Close()
+
+		client := setupTestGitHubClient(t, server.URL)
+		mockAppClient := &MockAppClient{Client: client}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		results, err := searcher.ListClosedPRs(ctx, "test-org", 24)
+		if err != nil {
+			t.Fatalf("ListClosedPRs() error = %v, want nil", err)
+		}
+
+		if len(results) != 1 {
+			t.Errorf("ListClosedPRs() returned %d results, want 1", len(results))
+		}
+	})
+
+	t.Run("client error", func(t *testing.T) {
+		mockAppClient := &MockAppClient{
+			ClientError: fmt.Errorf("no installation found"),
+		}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		_, err := searcher.ListClosedPRs(ctx, "test-org", 24)
+		if err == nil {
+			t.Error("ListClosedPRs() error = nil, want error")
+		}
+	})
+}
+
+// TestListAuthoredPRs tests listing authored PRs
+func TestListAuthoredPRs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful search", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			response := &github.IssuesSearchResult{
+				Total: github.Int(2),
+				Issues: []*github.Issue{
+					NewMockPRIssue("testowner", "testrepo", 111, "User's PR 1"),
+					NewMockPRIssue("testowner", "testrepo", 222, "User's PR 2"),
+				},
+			}
+			writeJSONResponse(t, w, response)
+		}))
+		defer server.Close()
+
+		client := setupTestGitHubClient(t, server.URL)
+		mockAppClient := &MockAppClient{Client: client}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		results, err := searcher.ListAuthoredPRs(ctx, "test-org", "testuser")
+		if err != nil {
+			t.Fatalf("ListAuthoredPRs() error = %v, want nil", err)
+		}
+
+		if len(results) != 2 {
+			t.Errorf("ListAuthoredPRs() returned %d results, want 2", len(results))
+		}
+	})
+
+	t.Run("client error", func(t *testing.T) {
+		mockAppClient := &MockAppClient{
+			ClientError: fmt.Errorf("no installation found"),
+		}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		_, err := searcher.ListAuthoredPRs(ctx, "test-org", "testuser")
+		if err == nil {
+			t.Error("ListAuthoredPRs() error = nil, want error")
+		}
+	})
+}
+
+// TestListReviewRequestedPRs tests listing review-requested PRs
+func TestListReviewRequestedPRs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("successful search", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			response := &github.IssuesSearchResult{
+				Total: github.Int(1),
+				Issues: []*github.Issue{
+					NewMockPRIssue("testowner", "testrepo", 333, "Review Requested PR"),
+				},
+			}
+			writeJSONResponse(t, w, response)
+		}))
+		defer server.Close()
+
+		client := setupTestGitHubClient(t, server.URL)
+		mockAppClient := &MockAppClient{Client: client}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		results, err := searcher.ListReviewRequestedPRs(ctx, "test-org", "testuser")
+		if err != nil {
+			t.Fatalf("ListReviewRequestedPRs() error = %v, want nil", err)
+		}
+
+		if len(results) != 1 {
+			t.Errorf("ListReviewRequestedPRs() returned %d results, want 1", len(results))
+		}
+	})
+
+	t.Run("client error", func(t *testing.T) {
+		mockAppClient := &MockAppClient{
+			ClientError: fmt.Errorf("no installation found"),
+		}
+		searcher := NewSearcher(mockAppClient, nil)
+
+		_, err := searcher.ListReviewRequestedPRs(ctx, "test-org", "testuser")
+		if err == nil {
+			t.Error("ListReviewRequestedPRs() error = nil, want error")
+		}
+	})
+}

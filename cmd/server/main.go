@@ -358,7 +358,7 @@ func (m *coordinatorManager) startSingleCoordinator(ctx context.Context, org str
 	m.notifyMgr.RegisterGuild(guildID, discordClient)
 
 	// Create user mapper
-	userMapper := usermapping.New(org, m.configManager, discordClient)
+	userMapper := usermapping.New(org, m.configManager, discordClient, m.store, guildID)
 
 	// Create Turn client with token provider (will fetch fresh tokens automatically)
 	turnClient := bot.NewTurnClient(m.cfg.TurnURL, ghClient)
@@ -482,6 +482,7 @@ func (m *coordinatorManager) discordClientForGuild(_ context.Context, guildID st
 	slashHandler.SetUserMapGetter(m)
 	slashHandler.SetChannelMapGetter(m)
 	slashHandler.SetDailyReportGetter(m)
+	slashHandler.SetStore(m.store)
 
 	// Register slash commands with Discord
 	if err := slashHandler.RegisterCommands(guildID); err != nil {

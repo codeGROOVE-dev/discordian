@@ -46,6 +46,14 @@ type DailyReportInfo struct {
 	GuildID    string    `json:"guild_id"`
 }
 
+// UserMappingInfo stores explicit GitHub-Discord user mappings.
+type UserMappingInfo struct {
+	CreatedAt      time.Time `json:"created_at"`
+	GitHubUsername string    `json:"github_username"`
+	DiscordUserID  string    `json:"discord_user_id"`
+	GuildID        string    `json:"guild_id"`
+}
+
 // Store provides persistent state operations.
 //
 //nolint:interfacebloat // Store handles threads, DMs, events, reports, and cleanup
@@ -78,6 +86,11 @@ type Store interface {
 	// Daily report tracking
 	DailyReportInfo(ctx context.Context, userID string) (DailyReportInfo, bool)
 	SaveDailyReportInfo(ctx context.Context, userID string, info DailyReportInfo) error
+
+	// User mapping tracking (GitHub username <-> Discord user ID)
+	UserMapping(ctx context.Context, guildID, gitHubUsername string) (UserMappingInfo, bool)
+	SaveUserMapping(ctx context.Context, guildID string, info UserMappingInfo) error
+	ListUserMappings(ctx context.Context, guildID string) []UserMappingInfo
 
 	// Lifecycle
 	Cleanup(ctx context.Context) error
