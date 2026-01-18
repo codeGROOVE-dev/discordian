@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/codeGROOVE-dev/discordian/internal/state"
 )
 
 const (
@@ -34,26 +36,31 @@ type cacheEntry struct {
 type Mapper struct {
 	configLookup  ConfigLookup
 	discordLookup DiscordLookup
+	store         state.Store
+	guildID       string
 	cache         map[string]cacheEntry
 	org           string
 	mu            sync.RWMutex
 }
 
 // New creates a new user mapper.
-func New(org string, configLookup ConfigLookup, discordLookup DiscordLookup) *Mapper {
+func New(org string, configLookup ConfigLookup, discordLookup DiscordLookup, store state.Store, guildID string) *Mapper {
 	return &Mapper{
 		org:           org,
 		configLookup:  configLookup,
 		discordLookup: discordLookup,
+		store:         store,
+		guildID:       guildID,
 		cache:         make(map[string]cacheEntry),
 	}
 }
 
 // DiscordID returns the Discord user ID for a GitHub username.
-// Uses a 3-tier lookup:
+// Uses a 4-tier lookup:
 // 1. YAML config mapping (explicit)
-// 2. Discord guild username match
-// 3. Empty string (fallback).
+// 2. Fido storage (self-service via /goose github-user command)
+// 3. Discord guild username match
+// 4. Empty string (fallback).
 // Results are cached for 24 hours.
 func (m *Mapper) DiscordID(ctx context.Context, githubUsername string) string {
 	// Check cache first (with TTL)
@@ -104,7 +111,21 @@ func (m *Mapper) DiscordID(ctx context.Context, githubUsername string) string {
 		}
 	}
 
-	// Tier 2: Discord username match
+	// Tier 2: Fido storage (self-service mappings)
+	if m.store != nil && m.guildID != "" {
+		if mapping, found := m.store.UserMapping(ctx, m.guildID, githubUsername); found {
+			m.cacheResult(githubUsername, mapping.DiscordUserID)
+			slog.Info("mapped GitHub user to Discord via Fido storage",
+				"github_username", githubUsername,
+				"discord_id", mapping.DiscordUserID,
+				"guild_id", m.guildID,
+				"org", m.org,
+				"method", "fido_storage")
+			return mapping.DiscordUserID
+		}
+	}
+
+	// Tier 3: Discord username match
 	if m.discordLookup != nil {
 		if id := m.discordLookup.LookupUserByUsername(ctx, githubUsername); id != "" {
 			m.cacheResult(githubUsername, id)
@@ -117,7 +138,7 @@ func (m *Mapper) DiscordID(ctx context.Context, githubUsername string) string {
 		}
 	}
 
-	// Tier 3: No mapping found
+	// Tier 4: No mapping found
 	slog.Info("no Discord mapping found for GitHub user",
 		"github_username", githubUsername,
 		"org", m.org,

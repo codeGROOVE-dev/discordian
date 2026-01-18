@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +13,10 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/codeGROOVE-dev/discordian/internal/format"
+	"github.com/codeGROOVE-dev/discordian/internal/state"
 )
+
+var gitHubUsernameRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`)
 
 // SlashCommandHandler handles Discord slash commands.
 type SlashCommandHandler struct {
@@ -23,6 +27,7 @@ type SlashCommandHandler struct {
 	userMapGetter     UserMapGetter
 	channelMapGetter  ChannelMapGetter
 	dailyReportGetter DailyReportGetter
+	store             state.Store
 	dashboardURL      string
 }
 
@@ -181,6 +186,11 @@ func (h *SlashCommandHandler) SetDashboardURL(url string) {
 	h.dashboardURL = url
 }
 
+// SetStore sets the state store.
+func (h *SlashCommandHandler) SetStore(store state.Store) {
+	h.store = store
+}
+
 // RegisterCommands registers the slash commands with Discord.
 func (h *SlashCommandHandler) RegisterCommands(guildID string) error {
 	commands := []*discordgo.ApplicationCommand{
@@ -217,6 +227,19 @@ func (h *SlashCommandHandler) RegisterCommands(guildID string) error {
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 					Name:        "channels",
 					Description: "Show repository to channel mappings",
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "github-user",
+					Description: "Link your Discord account to a GitHub username",
+					Options: []*discordgo.ApplicationCommandOption{
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "username",
+							Description: "Your GitHub username",
+							Required:    true,
+						},
+					},
 				},
 			},
 		},
@@ -285,6 +308,8 @@ func (h *SlashCommandHandler) handleGooseCommand(
 		h.handleUsersCommand(s, i)
 	case "channels":
 		h.handleChannelsCommand(s, i)
+	case "github-user":
+		h.handleGitHubUserCommand(s, i, data.Options[0])
 	default:
 		h.respondError(s, i, "Unknown subcommand")
 	}
@@ -859,6 +884,83 @@ func (h *SlashCommandHandler) handleChannelsCommand(s *discordgo.Session, i *dis
 	}
 
 	embed := h.formatChannelMappingsEmbed(mappings)
+	h.respond(s, i, embed)
+}
+
+func (h *SlashCommandHandler) handleGitHubUserCommand(
+	s *discordgo.Session,
+	i *discordgo.InteractionCreate,
+	option *discordgo.ApplicationCommandInteractionDataOption,
+) {
+	h.logger.Info("handling github-user command",
+		"guild_id", i.GuildID,
+		"user_id", i.Member.User.ID)
+
+	ctx := context.Background()
+	guildID := i.GuildID
+	discordUserID := i.Member.User.ID
+
+	if h.store == nil {
+		h.respondError(s, i, "User mapping storage is not available.")
+		return
+	}
+
+	// Extract GitHub username from options
+	if len(option.Options) == 0 {
+		h.respondError(s, i, "Please provide a GitHub username.")
+		return
+	}
+
+	gitHubUsername := option.Options[0].StringValue()
+
+	// Validate GitHub username format
+	// GitHub usernames can only contain alphanumeric characters and hyphens
+	// Must be between 1 and 39 characters
+	// Cannot start or end with hyphen
+	// Cannot have consecutive hyphens
+	if !gitHubUsernameRegex.MatchString(gitHubUsername) {
+		h.respondError(s, i, "Invalid GitHub username format. GitHub usernames can only contain alphanumeric characters and hyphens, and must be 1-39 characters long.")
+		return
+	}
+
+	// Save the mapping
+	mapping := state.UserMappingInfo{
+		GitHubUsername: gitHubUsername,
+		DiscordUserID:  discordUserID,
+		GuildID:        guildID,
+		CreatedAt:      time.Now(),
+	}
+
+	err := h.store.SaveUserMapping(ctx, guildID, mapping)
+	if err != nil {
+		h.logger.Error("failed to save user mapping",
+			"error", err,
+			"guild_id", guildID,
+			"github_username", gitHubUsername,
+			"discord_user_id", discordUserID)
+		h.respondError(s, i, "Failed to save user mapping. Please try again.")
+		return
+	}
+
+	// Success response
+	embed := &discordgo.MessageEmbed{
+		Color: 0x57F287, // Discord green
+		Author: &discordgo.MessageEmbedAuthor{
+			Name: "GitHub Account Linked",
+		},
+		Description: fmt.Sprintf("Successfully linked your Discord account to GitHub user `%s`.\n\nYou will now receive notifications for PRs associated with this GitHub account.", gitHubUsername),
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:  "GitHub Username",
+				Value: fmt.Sprintf("`%s`", gitHubUsername),
+			},
+			{
+				Name:  "Discord User",
+				Value: fmt.Sprintf("<@%s>", discordUserID),
+			},
+		},
+	}
+
 	h.respond(s, i, embed)
 }
 

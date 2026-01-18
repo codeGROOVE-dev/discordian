@@ -10,31 +10,41 @@ import (
 // MockSession is a programmable mock for discordgo.Session
 type MockSession struct {
 	// Programmable responses
-	OpenError                error
-	CloseError               error
-	MessageSendError         error
-	MessageEditError         error
-	UserChannelError         error
-	GuildMembersError        error
-	ChannelError             error
-	GuildChannelsError       error
-	MessagesError            error
-	ThreadsActiveError       error
-	ApplicationCommandsError error
-	InteractionResponseError error
+	OpenError                      error
+	CloseError                     error
+	MessageSendError               error
+	MessageEditError               error
+	UserChannelError               error
+	GuildMembersError              error
+	GuildMemberError               error
+	ChannelError                   error
+	GuildChannelsError             error
+	MessagesError                  error
+	ThreadsActiveError             error
+	ApplicationCommandsError       error
+	InteractionResponseError       error
+	ChannelMessageSendComplexError error
+	ChannelMessageEditComplexError error
+	ForumThreadStartComplexError   error
+	ChannelEditError               error
+	GuildError                     error
+	UserChannelPermissionsError    error
 
 	// Storage for tracking calls
 	SentMessages    []*sentMessage
 	EditedMessages  []*editedMessage
 	CreatedChannels []string
+	CreatedThreads  []*discordgo.Channel
 	Interactions    []*discordgo.InteractionResponse
 
 	// Mock data
 	Channels      map[string]*discordgo.Channel
 	Members       map[string][]*discordgo.Member
+	Guilds        map[string]*discordgo.Guild
 	Messages      map[string][]*discordgo.Message
 	ActiveThreads []*discordgo.Channel
 	Commands      []*discordgo.ApplicationCommand
+	MockState     *discordgo.State
 
 	mu sync.Mutex
 }
@@ -56,10 +66,13 @@ func NewMockSession() *MockSession {
 	return &MockSession{
 		SentMessages:   make([]*sentMessage, 0),
 		EditedMessages: make([]*editedMessage, 0),
+		CreatedThreads: make([]*discordgo.Channel, 0),
 		Channels:       make(map[string]*discordgo.Channel),
 		Members:        make(map[string][]*discordgo.Member),
+		Guilds:         make(map[string]*discordgo.Guild),
 		Messages:       make(map[string][]*discordgo.Message),
 		Commands:       make([]*discordgo.ApplicationCommand, 0),
+		MockState:      discordgo.NewState(),
 	}
 }
 
@@ -314,4 +327,292 @@ func NewMockMessage(id, channelID, content, authorID string) *discordgo.Message 
 			ID: authorID,
 		},
 	}
+}
+
+// ChannelMessageSendComplex mocks sending a complex message
+func (m *MockSession) ChannelMessageSendComplex(channelID string, data *discordgo.MessageSend, options ...discordgo.RequestOption) (*discordgo.Message, error) {
+	if m.ChannelMessageSendComplexError != nil {
+		return nil, m.ChannelMessageSendComplexError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var embed *discordgo.MessageEmbed
+	if len(data.Embeds) > 0 {
+		embed = data.Embeds[0]
+	}
+
+	m.SentMessages = append(m.SentMessages, &sentMessage{
+		ChannelID: channelID,
+		Content:   data.Content,
+		Embed:     embed,
+	})
+
+	msgID := fmt.Sprintf("msg-%d", len(m.SentMessages))
+	return &discordgo.Message{
+		ID:        msgID,
+		ChannelID: channelID,
+		Content:   data.Content,
+		Embeds:    data.Embeds,
+	}, nil
+}
+
+// ChannelMessageEditComplex mocks editing a complex message
+func (m *MockSession) ChannelMessageEditComplex(data *discordgo.MessageEdit, options ...discordgo.RequestOption) (*discordgo.Message, error) {
+	if m.ChannelMessageEditComplexError != nil {
+		return nil, m.ChannelMessageEditComplexError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	content := ""
+	if data.Content != nil {
+		content = *data.Content
+	}
+
+	var embed *discordgo.MessageEmbed
+	if data.Embeds != nil && len(*data.Embeds) > 0 {
+		embed = (*data.Embeds)[0]
+	}
+
+	m.EditedMessages = append(m.EditedMessages, &editedMessage{
+		ChannelID: data.Channel,
+		MessageID: data.ID,
+		Content:   content,
+		Embed:     embed,
+	})
+
+	return &discordgo.Message{
+		ID:        data.ID,
+		ChannelID: data.Channel,
+		Content:   content,
+	}, nil
+}
+
+// ForumThreadStartComplex mocks creating a forum thread
+func (m *MockSession) ForumThreadStartComplex(channelID string, threadData *discordgo.ThreadStart, messageData *discordgo.MessageSend, options ...discordgo.RequestOption) (*discordgo.Channel, error) {
+	if m.ForumThreadStartComplexError != nil {
+		return nil, m.ForumThreadStartComplexError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	threadID := fmt.Sprintf("thread-%d", len(m.CreatedThreads)+1)
+	thread := &discordgo.Channel{
+		ID:       threadID,
+		Name:     threadData.Name,
+		Type:     discordgo.ChannelTypeGuildPublicThread,
+		ParentID: channelID,
+	}
+
+	m.CreatedThreads = append(m.CreatedThreads, thread)
+
+	// Also create the initial message in the thread
+	msgID := fmt.Sprintf("msg-%d", len(m.SentMessages)+1)
+	message := &discordgo.Message{
+		ID:        msgID,
+		ChannelID: threadID,
+		Content:   messageData.Content,
+	}
+	m.Messages[threadID] = []*discordgo.Message{message}
+
+	return thread, nil
+}
+
+// ChannelEdit mocks editing a channel
+func (m *MockSession) ChannelEdit(channelID string, data *discordgo.ChannelEdit, options ...discordgo.RequestOption) (*discordgo.Channel, error) {
+	if m.ChannelEditError != nil {
+		return nil, m.ChannelEditError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Update or create channel
+	channel, exists := m.Channels[channelID]
+	if !exists {
+		channel = &discordgo.Channel{
+			ID: channelID,
+		}
+		m.Channels[channelID] = channel
+	}
+
+	if data.Name != "" {
+		channel.Name = data.Name
+	}
+	if data.Archived != nil {
+		channel.ThreadMetadata = &discordgo.ThreadMetadata{
+			Archived: *data.Archived,
+		}
+	}
+
+	return channel, nil
+}
+
+// ChannelMessage mocks retrieving a single message
+func (m *MockSession) ChannelMessage(channelID, messageID string, options ...discordgo.RequestOption) (*discordgo.Message, error) {
+	if m.MessagesError != nil {
+		return nil, m.MessagesError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if messages, ok := m.Messages[channelID]; ok {
+		for _, msg := range messages {
+			if msg.ID == messageID {
+				return msg, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("message not found")
+}
+
+// GetState returns the mock state
+func (m *MockSession) GetState() *discordgo.State {
+	return m.MockState
+}
+
+// GuildMember mocks fetching a single guild member
+func (m *MockSession) GuildMember(guildID, userID string, options ...discordgo.RequestOption) (*discordgo.Member, error) {
+	if m.GuildMemberError != nil {
+		return nil, m.GuildMemberError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if members, ok := m.Members[guildID]; ok {
+		for _, member := range members {
+			if member.User.ID == userID {
+				return member, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("member not found")
+}
+
+// Guild mocks fetching guild information
+func (m *MockSession) Guild(guildID string, options ...discordgo.RequestOption) (*discordgo.Guild, error) {
+	if m.GuildError != nil {
+		return nil, m.GuildError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if guild, ok := m.Guilds[guildID]; ok {
+		return guild, nil
+	}
+
+	return nil, fmt.Errorf("guild not found")
+}
+
+// UserChannelPermissions mocks checking user permissions
+func (m *MockSession) UserChannelPermissions(userID, channelID string, fetchOptions ...discordgo.RequestOption) (int64, error) {
+	if m.UserChannelPermissionsError != nil {
+		return 0, m.UserChannelPermissionsError
+	}
+
+	// Return full permissions for testing
+	return discordgo.PermissionAll, nil
+}
+
+// GuildThreadsActive mocks fetching active threads
+func (m *MockSession) GuildThreadsActive(guildID string, options ...discordgo.RequestOption) (*discordgo.ThreadsList, error) {
+	if m.ThreadsActiveError != nil {
+		return nil, m.ThreadsActiveError
+	}
+
+	return &discordgo.ThreadsList{
+		Threads: m.ActiveThreads,
+	}, nil
+}
+
+// ApplicationCommandCreate mocks creating a slash command
+func (m *MockSession) ApplicationCommandCreate(appID, guildID string, cmd *discordgo.ApplicationCommand, options ...discordgo.RequestOption) (*discordgo.ApplicationCommand, error) {
+	if m.ApplicationCommandsError != nil {
+		return nil, m.ApplicationCommandsError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Assign an ID to the command
+	cmd.ID = fmt.Sprintf("cmd-%d", len(m.Commands)+1)
+	cmd.ApplicationID = appID
+	cmd.GuildID = guildID
+
+	m.Commands = append(m.Commands, cmd)
+	return cmd, nil
+}
+
+// ApplicationCommands mocks listing slash commands
+func (m *MockSession) ApplicationCommands(appID, guildID string, options ...discordgo.RequestOption) ([]*discordgo.ApplicationCommand, error) {
+	if m.ApplicationCommandsError != nil {
+		return nil, m.ApplicationCommandsError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.Commands, nil
+}
+
+// ApplicationCommandDelete mocks deleting a slash command
+func (m *MockSession) ApplicationCommandDelete(appID, guildID, cmdID string, options ...discordgo.RequestOption) error {
+	if m.ApplicationCommandsError != nil {
+		return m.ApplicationCommandsError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Remove command from the list
+	for i, cmd := range m.Commands {
+		if cmd.ID == cmdID {
+			m.Commands = append(m.Commands[:i], m.Commands[i+1:]...)
+			break
+		}
+	}
+
+	return nil
+}
+
+// InteractionResponseEdit mocks editing an interaction response
+func (m *MockSession) InteractionResponseEdit(interaction *discordgo.Interaction, data *discordgo.WebhookEdit, options ...discordgo.RequestOption) (*discordgo.Message, error) {
+	if m.InteractionResponseError != nil {
+		return nil, m.InteractionResponseError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	content := ""
+	if data.Content != nil {
+		content = *data.Content
+	}
+
+	var embeds []*discordgo.MessageEmbed
+	if data.Embeds != nil {
+		embeds = *data.Embeds
+	}
+
+	return &discordgo.Message{
+		ID:      interaction.ID,
+		Content: content,
+		Embeds:  embeds,
+	}, nil
+}
+
+// AddHandler mocks adding a handler (no-op for testing)
+func (m *MockSession) AddHandler(handler interface{}) func() {
+	// In tests, we don't need to actually register handlers
+	// Return a no-op cleanup function
+	return func() {}
 }

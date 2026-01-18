@@ -453,3 +453,110 @@ func TestMemoryStore_ListDMUsers(t *testing.T) {
 		t.Errorf("ListDMUsers(pr2)[0] = %q, want user1", users[0])
 	}
 }
+
+// TestMemoryStore_UserMapping tests user mapping operations.
+func TestMemoryStore_UserMapping(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	guildID := "guild-123"
+	githubUser1 := "octocat"
+	githubUser2 := "torvalds"
+
+	// Initially no mapping
+	_, ok := store.UserMapping(ctx, guildID, githubUser1)
+	if ok {
+		t.Error("UserMapping() found non-existent mapping")
+	}
+
+	// Save mapping
+	info1 := UserMappingInfo{
+		GitHubUsername: githubUser1,
+		DiscordUserID:  "discord-123",
+		GuildID:        guildID,
+		CreatedAt:      time.Now(),
+	}
+	if err := store.SaveUserMapping(ctx, guildID, info1); err != nil {
+		t.Fatalf("SaveUserMapping() error = %v", err)
+	}
+
+	// Retrieve mapping
+	got, ok := store.UserMapping(ctx, guildID, githubUser1)
+	if !ok {
+		t.Fatal("UserMapping() did not find saved mapping")
+	}
+	if got.GitHubUsername != githubUser1 {
+		t.Errorf("UserMapping().GitHubUsername = %q, want %q", got.GitHubUsername, githubUser1)
+	}
+	if got.DiscordUserID != "discord-123" {
+		t.Errorf("UserMapping().DiscordUserID = %q, want %q", got.DiscordUserID, "discord-123")
+	}
+	if got.GuildID != guildID {
+		t.Errorf("UserMapping().GuildID = %q, want %q", got.GuildID, guildID)
+	}
+
+	// Save second mapping
+	info2 := UserMappingInfo{
+		GitHubUsername: githubUser2,
+		DiscordUserID:  "discord-456",
+		GuildID:        guildID,
+		CreatedAt:      time.Now(),
+	}
+	if err := store.SaveUserMapping(ctx, guildID, info2); err != nil {
+		t.Fatalf("SaveUserMapping() error = %v", err)
+	}
+
+	// List mappings for guild
+	mappings := store.ListUserMappings(ctx, guildID)
+	if len(mappings) != 2 {
+		t.Fatalf("ListUserMappings() returned %d mappings, want 2", len(mappings))
+	}
+
+	// Verify both mappings are present
+	foundUsers := make(map[string]bool)
+	for _, m := range mappings {
+		foundUsers[m.GitHubUsername] = true
+		if m.GuildID != guildID {
+			t.Errorf("ListUserMappings() mapping has GuildID %q, want %q", m.GuildID, guildID)
+		}
+	}
+	if !foundUsers[githubUser1] {
+		t.Error("ListUserMappings() should include octocat")
+	}
+	if !foundUsers[githubUser2] {
+		t.Error("ListUserMappings() should include torvalds")
+	}
+
+	// Different guild should have no mappings
+	mappings2 := store.ListUserMappings(ctx, "different-guild")
+	if len(mappings2) != 0 {
+		t.Errorf("ListUserMappings(different-guild) returned %d mappings, want 0", len(mappings2))
+	}
+
+	// Update existing mapping
+	info1Updated := UserMappingInfo{
+		GitHubUsername: githubUser1,
+		DiscordUserID:  "discord-789",
+		GuildID:        guildID,
+		CreatedAt:      time.Now(),
+	}
+	if err := store.SaveUserMapping(ctx, guildID, info1Updated); err != nil {
+		t.Fatalf("SaveUserMapping() update error = %v", err)
+	}
+
+	// Verify update
+	got, ok = store.UserMapping(ctx, guildID, githubUser1)
+	if !ok {
+		t.Fatal("UserMapping() did not find updated mapping")
+	}
+	if got.DiscordUserID != "discord-789" {
+		t.Errorf("UserMapping().DiscordUserID = %q, want %q after update", got.DiscordUserID, "discord-789")
+	}
+
+	// Still only 2 mappings (update, not insert)
+	mappings = store.ListUserMappings(ctx, guildID)
+	if len(mappings) != 2 {
+		t.Errorf("ListUserMappings() after update returned %d mappings, want 2", len(mappings))
+	}
+}

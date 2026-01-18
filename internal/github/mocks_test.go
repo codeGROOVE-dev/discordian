@@ -93,3 +93,23 @@ func NewMockPRIssue(owner, repo string, number int, title string) *github.Issue 
 		},
 	}
 }
+
+// MockAppClient mocks the AppClient for testing
+type MockAppClient struct {
+	Client         *github.Client
+	ClientForOrgFn func(ctx context.Context, org string) (*github.Client, error)
+	ClientError    error
+}
+
+func (m *MockAppClient) ClientForOrg(ctx context.Context, org string) (*github.Client, error) {
+	if m.ClientForOrgFn != nil {
+		return m.ClientForOrgFn(ctx, org)
+	}
+	if m.ClientError != nil {
+		return nil, m.ClientError
+	}
+	if m.Client != nil {
+		return m.Client, nil
+	}
+	return github.NewClient(nil), nil
+}

@@ -151,6 +151,18 @@ func (m *mockStateStore) SaveDailyReportInfo(_ context.Context, userID string, i
 	return nil
 }
 
+func (m *mockStateStore) UserMapping(_ context.Context, _, _ string) (state.UserMappingInfo, bool) {
+	return state.UserMappingInfo{}, false
+}
+
+func (m *mockStateStore) SaveUserMapping(_ context.Context, _ string, _ state.UserMappingInfo) error {
+	return nil
+}
+
+func (m *mockStateStore) ListUserMappings(_ context.Context, _ string) []state.UserMappingInfo {
+	return nil
+}
+
 func (m *mockStateStore) Cleanup(_ context.Context) error {
 	return nil
 }

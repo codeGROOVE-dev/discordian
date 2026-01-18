@@ -20,6 +20,7 @@ func newTestFidoStore(t *testing.T) *FidoStore {
 		WithReportStore(null.New[string, DailyReportInfo]()),
 		WithPendingStore(null.New[string, pendingDMQueue]()),
 		WithEventStore(null.New[string, time.Time]()),
+		WithUserMappingStore(null.New[string, UserMappingInfo]()),
 	)
 	if err != nil {
 		t.Fatalf("failed to create test fido store: %v", err)
@@ -596,5 +597,80 @@ func TestFidoStore_ClaimDM(t *testing.T) {
 	// Should be able to claim again after expiry
 	if !store.ClaimDM(ctx, userID, prURL, time.Second) {
 		t.Error("ClaimDM() should succeed after lock expiry")
+	}
+}
+
+// TestFidoStore_UserMapping tests user mapping operations with FidoStore.
+func TestFidoStore_UserMapping(t *testing.T) {
+	ctx := context.Background()
+	store := newTestFidoStore(t)
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	guildID := "guild-123"
+	githubUser1 := "octocat"
+	githubUser2 := "torvalds"
+
+	// Initially no mapping
+	_, ok := store.UserMapping(ctx, guildID, githubUser1)
+	if ok {
+		t.Error("UserMapping() found non-existent mapping")
+	}
+
+	// Save mapping
+	info1 := UserMappingInfo{
+		GitHubUsername: githubUser1,
+		DiscordUserID:  "discord-123",
+		GuildID:        guildID,
+		CreatedAt:      time.Now(),
+	}
+	if err := store.SaveUserMapping(ctx, guildID, info1); err != nil {
+		t.Fatalf("SaveUserMapping() error = %v", err)
+	}
+
+	// Retrieve mapping
+	got, ok := store.UserMapping(ctx, guildID, githubUser1)
+	if !ok {
+		t.Fatal("UserMapping() did not find saved mapping")
+	}
+	if got.GitHubUsername != githubUser1 {
+		t.Errorf("UserMapping().GitHubUsername = %q, want %q", got.GitHubUsername, githubUser1)
+	}
+	if got.DiscordUserID != "discord-123" {
+		t.Errorf("UserMapping().DiscordUserID = %q, want %q", got.DiscordUserID, "discord-123")
+	}
+
+	// Save second mapping
+	info2 := UserMappingInfo{
+		GitHubUsername: githubUser2,
+		DiscordUserID:  "discord-456",
+		GuildID:        guildID,
+		CreatedAt:      time.Now(),
+	}
+	if err := store.SaveUserMapping(ctx, guildID, info2); err != nil {
+		t.Fatalf("SaveUserMapping() error = %v", err)
+	}
+
+	// Note: ListUserMappings is not fully implemented for FidoStore yet
+	// Skip the list tests for now
+	_ = guildID
+	_ = githubUser2
+}
+
+// TestFidoStore_ListUserMappings tests that ListUserMappings returns empty slice
+func TestFidoStore_ListUserMappings(t *testing.T) {
+	ctx := context.Background()
+	store := newTestFidoStore(t)
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	// ListUserMappings currently returns empty slice and logs a warning
+	// This is a known limitation of FidoStore
+	mappings := store.ListUserMappings(ctx, "guild-123")
+
+	if mappings == nil {
+		t.Error("ListUserMappings() should not return nil")
+	}
+
+	if len(mappings) != 0 {
+		t.Errorf("ListUserMappings() = %v, want empty slice", mappings)
 	}
 }

@@ -16,7 +16,8 @@ type MemoryStore struct {
 	processed    map[string]time.Time
 	pendingDMs   map[string]*PendingDM
 	dailyReports map[string]DailyReportInfo
-	claims       map[string]time.Time // claimKey -> expiry time
+	userMappings map[string]UserMappingInfo // guildID:gitHubUsername -> UserMappingInfo
+	claims       map[string]time.Time       // claimKey -> expiry time
 	mu           sync.RWMutex
 	threadRetain time.Duration
 	dmRetain     time.Duration
@@ -32,6 +33,7 @@ func NewMemoryStore() *MemoryStore {
 		processed:    make(map[string]time.Time),
 		pendingDMs:   make(map[string]*PendingDM),
 		dailyReports: make(map[string]DailyReportInfo),
+		userMappings: make(map[string]UserMappingInfo),
 		claims:       make(map[string]time.Time),
 		threadRetain: 30 * 24 * time.Hour, // 30 days
 		dmRetain:     90 * 24 * time.Hour, // 90 days
@@ -45,6 +47,10 @@ func threadKey(owner, repo string, number int, channelID string) string {
 
 func dmKey(userID, prURL string) string {
 	return fmt.Sprintf("%s:%s", userID, prURL)
+}
+
+func userMappingKey(guildID, gitHubUsername string) string {
+	return fmt.Sprintf("%s:%s", guildID, gitHubUsername)
 }
 
 // Thread returns thread info for a PR in a channel.
@@ -310,6 +316,47 @@ func (s *MemoryStore) Cleanup(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// UserMapping returns user mapping info for a GitHub username in a guild.
+func (s *MemoryStore) UserMapping(ctx context.Context, guildID, gitHubUsername string) (UserMappingInfo, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	info, exists := s.userMappings[userMappingKey(guildID, gitHubUsername)]
+	return info, exists
+}
+
+// SaveUserMapping saves user mapping info for a GitHub username.
+func (s *MemoryStore) SaveUserMapping(ctx context.Context, guildID string, info UserMappingInfo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	info.CreatedAt = time.Now()
+	info.GuildID = guildID
+	s.userMappings[userMappingKey(guildID, info.GitHubUsername)] = info
+
+	slog.Info("saved user mapping",
+		"guild_id", guildID,
+		"github_username", info.GitHubUsername,
+		"discord_user_id", info.DiscordUserID)
+
+	return nil
+}
+
+// ListUserMappings returns all user mappings for a guild.
+func (s *MemoryStore) ListUserMappings(ctx context.Context, guildID string) []UserMappingInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var mappings []UserMappingInfo
+	for _, info := range s.userMappings {
+		if info.GuildID == guildID {
+			mappings = append(mappings, info)
+		}
+	}
+
+	return mappings
 }
 
 // Close closes the store (no-op for memory store).

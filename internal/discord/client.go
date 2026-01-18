@@ -18,7 +18,8 @@ import (
 
 // Client wraps discordgo.Session with a clean interface for bot operations.
 type Client struct {
-	session          *discordgo.Session
+	session          session
+	realSession      *discordgo.Session               // Keep reference for Session() method
 	channelCache     map[string]string                // channel name -> ID
 	channelTypeCache map[string]discordgo.ChannelType // channel ID -> type
 	userCache        map[string]string                // username -> ID
@@ -42,7 +43,8 @@ func New(token string) (*Client, error) {
 		discordgo.IntentsMessageContent
 
 	return &Client{
-		session:          session,
+		session:          &sessionAdapter{Session: session},
+		realSession:      session,
 		channelCache:     make(map[string]string),
 		channelTypeCache: make(map[string]discordgo.ChannelType),
 		userCache:        make(map[string]string),
@@ -106,7 +108,7 @@ func (c *Client) Close() error {
 
 // Session returns the underlying discordgo session.
 func (c *Client) Session() *discordgo.Session {
-	return c.session
+	return c.realSession
 }
 
 // PostMessage sends a plain text message to a channel with link embeds suppressed.
@@ -423,7 +425,7 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 		"guild_id", guildID,
 		"total_members", len(members))
 
-	// Tier 1: Exact match (Username takes precedence over GlobalName)
+	// Tier 1: Exact match (Username takes precedence over GlobalName, then Nick)
 	for _, member := range members {
 		if member.User.Username != username {
 			continue
@@ -456,8 +458,25 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 
 		return member.User.ID
 	}
+	for _, member := range members {
+		if member.Nick != username {
+			continue
+		}
+		c.mu.Lock()
+		c.userCache[username] = member.User.ID
+		c.mu.Unlock()
 
-	// Tier 2: Case-insensitive match (Username takes precedence over GlobalName)
+		slog.Debug("found user by exact nickname match",
+			"username", username,
+			"user_id", member.User.ID,
+			"discord_username", member.User.Username,
+			"discord_global_name", member.User.GlobalName,
+			"discord_nick", member.Nick)
+
+		return member.User.ID
+	}
+
+	// Tier 2: Case-insensitive match (Username takes precedence over GlobalName, then Nick)
 	for _, member := range members {
 		if !strings.EqualFold(member.User.Username, username) {
 			continue
@@ -490,6 +509,23 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 
 		return member.User.ID
 	}
+	for _, member := range members {
+		if !strings.EqualFold(member.Nick, username) {
+			continue
+		}
+		c.mu.Lock()
+		c.userCache[username] = member.User.ID
+		c.mu.Unlock()
+
+		slog.Info("found user by case-insensitive nickname match",
+			"username", username,
+			"user_id", member.User.ID,
+			"discord_username", member.User.Username,
+			"discord_global_name", member.User.GlobalName,
+			"discord_nick", member.Nick)
+
+		return member.User.ID
+	}
 
 	lowerUsername := strings.ToLower(username)
 
@@ -503,11 +539,14 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 	for _, member := range members {
 		usernamePrefix := strings.HasPrefix(strings.ToLower(member.User.Username), lowerUsername)
 		globalNamePrefix := strings.HasPrefix(strings.ToLower(member.User.GlobalName), lowerUsername)
+		nickPrefix := strings.HasPrefix(strings.ToLower(member.Nick), lowerUsername)
 
 		if usernamePrefix {
 			matches = append(matches, prefixMatch{member: member, matchType: "username_prefix"})
 		} else if globalNamePrefix {
 			matches = append(matches, prefixMatch{member: member, matchType: "global_name_prefix"})
+		} else if nickPrefix {
+			matches = append(matches, prefixMatch{member: member, matchType: "nick_prefix"})
 		}
 	}
 
@@ -551,6 +590,7 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 			"index", i,
 			"discord_username", member.User.Username,
 			"discord_global_name", member.User.GlobalName,
+			"discord_nick", member.Nick,
 			"user_id", member.User.ID)
 	}
 
@@ -563,11 +603,11 @@ func (c *Client) LookupUserByUsername(ctx context.Context, username string) stri
 
 // IsBotInChannel checks if the bot has permission to send messages in a channel.
 func (c *Client) IsBotInChannel(ctx context.Context, channelID string) bool {
-	if c.session.State == nil || c.session.State.User == nil {
+	if c.session.GetState() == nil || c.session.GetState().User == nil {
 		return false
 	}
 
-	perms, err := c.session.UserChannelPermissions(c.session.State.User.ID, channelID)
+	perms, err := c.session.UserChannelPermissions(c.session.GetState().User.ID, channelID)
 	if err != nil {
 		slog.Debug("failed to check channel permissions",
 			"channel_id", channelID,
@@ -618,7 +658,7 @@ func (c *Client) IsUserActive(ctx context.Context, userID string) bool {
 	}
 
 	// Get guild from state
-	guild, err := c.session.State.Guild(guildID)
+	guild, err := c.session.GetState().Guild(guildID)
 	if err != nil {
 		slog.Debug("failed to get guild from state",
 			"guild_id", guildID,
@@ -681,13 +721,13 @@ type BotInfo struct {
 
 // BotInfo returns the bot's user information.
 func (c *Client) BotInfo(ctx context.Context) (BotInfo, error) {
-	if c.session.State == nil || c.session.State.User == nil {
+	if c.session.GetState() == nil || c.session.GetState().User == nil {
 		return BotInfo{}, errors.New("bot user not available")
 	}
 
 	return BotInfo{
-		UserID:   c.session.State.User.ID,
-		Username: c.session.State.User.Username,
+		UserID:   c.session.GetState().User.ID,
+		Username: c.session.GetState().User.Username,
 	}, nil
 }
 
@@ -707,7 +747,7 @@ func (c *Client) FindForumThread(ctx context.Context, forumID, prURL string) (th
 	var threads *discordgo.ThreadsList
 	err := retryableCtx(ctx, func() error {
 		var err error
-		threads, err = c.session.GuildThreadsActive(c.guildID)
+		threads, err = c.session.ThreadsActive(c.guildID)
 		return err
 	})
 	if err != nil {
@@ -733,10 +773,11 @@ func (c *Client) FindForumThread(ctx context.Context, forumID, prURL string) (th
 	}
 
 	// Also check archived threads (recently archived) with retry
+	// Use realSession directly since ThreadsArchived is not in the session interface
 	var archivedThreads *discordgo.ThreadsList
 	err = retryableCtx(ctx, func() error {
 		var err error
-		archivedThreads, err = c.session.ThreadsArchived(forumID, nil, 50)
+		archivedThreads, err = c.realSession.ThreadsArchived(forumID, nil, 50)
 		return err
 	})
 	if err != nil {
@@ -776,8 +817,8 @@ func (c *Client) FindChannelMessage(ctx context.Context, channelID, prURL string
 	}
 
 	var botID string
-	if c.session.State != nil && c.session.State.User != nil {
-		botID = c.session.State.User.ID
+	if c.session.GetState() != nil && c.session.GetState().User != nil {
+		botID = c.session.GetState().User.ID
 	}
 
 	slog.Info("searching for existing channel message",
@@ -838,8 +879,8 @@ func (c *Client) FindDMForPR(ctx context.Context, userID, prURL string) (channel
 	}
 
 	var botID string
-	if c.session.State != nil && c.session.State.User != nil {
-		botID = c.session.State.User.ID
+	if c.session.GetState() != nil && c.session.GetState().User != nil {
+		botID = c.session.GetState().User.ID
 	}
 
 	var messages []*discordgo.Message

@@ -12,14 +12,19 @@ import (
 	"github.com/google/go-github/v50/github"
 )
 
+// appClient defines the interface for getting GitHub clients for orgs.
+type appClient interface {
+	ClientForOrg(ctx context.Context, org string) (*github.Client, error)
+}
+
 // Searcher queries GitHub for PRs using the search API.
 type Searcher struct {
-	appClient *AppClient
+	appClient appClient
 	logger    *slog.Logger
 }
 
 // NewSearcher creates a new PR searcher.
-func NewSearcher(appClient *AppClient, logger *slog.Logger) *Searcher {
+func NewSearcher(appClient appClient, logger *slog.Logger) *Searcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
