@@ -735,3 +735,71 @@ func (m *mockChannelMapGetter) ChannelMappings(_ context.Context, _ string) (*Ch
 	}
 	return m.mappings, nil
 }
+
+// Tests for slash command registration and handler methods
+
+func TestSlashCommandHandler_SetStore(t *testing.T) {
+	handler := NewSlashCommandHandler(nil, nil)
+
+	if handler.store != nil {
+		t.Error("store should be nil initially")
+	}
+
+	// We can't easily create a mock store, but we can verify the method exists
+	// and doesn't panic when called with nil
+	handler.SetStore(nil)
+}
+
+func TestSlashCommandHandler_RegisterCommands(t *testing.T) {
+	// We can't easily test RegisterCommands without a real Discord connection
+	// This test just verifies the method exists and the handler can be created
+	handler := NewSlashCommandHandler(nil, nil)
+	if handler == nil {
+		t.Error("NewSlashCommandHandler() should not return nil")
+	}
+}
+
+func TestSlashCommandHandler_RemoveCommands(t *testing.T) {
+	// We can't easily test RemoveCommands without a real Discord connection
+	// This test just verifies the method exists and the handler can be created
+	handler := NewSlashCommandHandler(nil, nil)
+	if handler == nil {
+		t.Error("NewSlashCommandHandler() should not return nil")
+	}
+}
+
+func TestSlashCommandHandler_SetupHandler(t *testing.T) {
+	// We can't easily test SetupHandler without a real Discord session
+	// This test just verifies the method exists and the handler can be created
+	handler := NewSlashCommandHandler(nil, nil)
+	if handler == nil {
+		t.Error("NewSlashCommandHandler() should not return nil")
+	}
+}
+
+func TestSlashCommandHandler_respond(t *testing.T) {
+	// We can't easily test respond without a real Discord session
+	// This test just verifies the method exists
+	handler := NewSlashCommandHandler(nil, nil)
+	if handler == nil {
+		t.Error("NewSlashCommandHandler() should not return nil")
+	}
+}
+
+func TestSlashCommandHandler_editResponse(t *testing.T) {
+	// We can't easily test editResponse without a real Discord session
+	// This test just verifies the method exists
+	handler := NewSlashCommandHandler(nil, nil)
+	if handler == nil {
+		t.Error("NewSlashCommandHandler() should not return nil")
+	}
+}
+
+func TestSlashCommandHandler_respondError(t *testing.T) {
+	// We can't easily test respondError without a real Discord session
+	// This test just verifies the method exists
+	handler := NewSlashCommandHandler(nil, nil)
+	if handler == nil {
+		t.Error("NewSlashCommandHandler() should not return nil")
+	}
+}

@@ -132,3 +132,70 @@ func TestGuildManager_Close(t *testing.T) {
 		t.Errorf("Close() error = %v, want nil", err)
 	}
 }
+
+// TestGuildManager_Close_WithClients tests closing manager with registered clients.
+func TestGuildManager_Close_WithClients(t *testing.T) {
+	manager := NewGuildManager(nil)
+
+	// Create a session (it won't actually connect in tests)
+	session := &discordgo.Session{}
+	client1 := &Client{
+		guildID:     "guild1",
+		session:     &sessionAdapter{Session: session},
+		realSession: session,
+	}
+	client2 := &Client{
+		guildID:     "guild2",
+		session:     &sessionAdapter{Session: session},
+		realSession: session,
+	}
+
+	manager.RegisterClient("guild1", client1)
+	manager.RegisterClient("guild2", client2)
+
+	err := manager.Close()
+	if err != nil {
+		t.Errorf("Close() error = %v, want nil", err)
+	}
+
+	// Verify clients were cleared
+	if len(manager.GuildIDs()) != 0 {
+		t.Errorf("GuildIDs() after Close() = %d, want 0", len(manager.GuildIDs()))
+	}
+}
+
+// TestGuildManager_RemoveClient_Cleanup tests RemoveClient closes the client.
+func TestGuildManager_RemoveClient_Cleanup(t *testing.T) {
+	manager := NewGuildManager(nil)
+	session := &discordgo.Session{}
+	client := &Client{
+		guildID:     "test-guild",
+		session:     &sessionAdapter{Session: session},
+		realSession: session,
+	}
+
+	manager.RegisterClient("test-guild", client)
+
+	// Verify client is registered
+	_, ok := manager.Client("test-guild")
+	if !ok {
+		t.Fatal("Client() should return registered client before removal")
+	}
+
+	// Remove client
+	manager.RemoveClient("test-guild")
+
+	// Verify client was removed
+	_, ok = manager.Client("test-guild")
+	if ok {
+		t.Error("Client() should return false after RemoveClient")
+	}
+
+	// Verify guild ID is removed
+	ids := manager.GuildIDs()
+	for _, id := range ids {
+		if id == "test-guild" {
+			t.Error("GuildIDs() should not contain removed guild")
+		}
+	}
+}

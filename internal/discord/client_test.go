@@ -754,6 +754,54 @@ func TestClient_UpdateForumPost_NoMessageID(t *testing.T) {
 	}
 }
 
+// TestClient_UpdateForumPost_TitleEditError tests UpdateForumPost when title edit fails.
+func TestClient_UpdateForumPost_TitleEditError(t *testing.T) {
+	mockSession := NewMockSession()
+	mockSession.ChannelEditError = fmt.Errorf("title edit failed")
+	client := newTestClientWithMock(mockSession)
+
+	ctx := context.Background()
+	err := client.UpdateForumPost(ctx, "thread-123", "msg-456", "New Title", "New Content")
+	if err == nil {
+		t.Error("UpdateForumPost() error = nil, want error when title edit fails")
+	}
+}
+
+// TestClient_UpdateForumPost_MessageEditError tests UpdateForumPost when message edit fails.
+func TestClient_UpdateForumPost_MessageEditError(t *testing.T) {
+	mockSession := NewMockSession()
+	mockSession.ChannelMessageEditComplexError = fmt.Errorf("message edit failed")
+	client := newTestClientWithMock(mockSession)
+
+	ctx := context.Background()
+	err := client.UpdateForumPost(ctx, "thread-123", "msg-456", "New Title", "New Content")
+	if err == nil {
+		t.Error("UpdateForumPost() error = nil, want error when message edit fails")
+	}
+}
+
+// TestClient_PostForumThread_MessagesFetchError tests when ChannelMessages fails.
+func TestClient_PostForumThread_MessagesFetchError(t *testing.T) {
+	mockSession := NewMockSession()
+	mockSession.MessagesError = fmt.Errorf("messages fetch failed")
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("guild-123")
+
+	ctx := context.Background()
+	threadID, messageID, err := client.PostForumThread(ctx, "channel-123", "title", "content")
+
+	// Should succeed but return empty messageID
+	if err != nil {
+		t.Errorf("PostForumThread() error = %v, want nil", err)
+	}
+	if threadID == "" {
+		t.Error("PostForumThread() threadID = empty, want non-empty")
+	}
+	if messageID != "" {
+		t.Errorf("PostForumThread() messageID = %q, want empty when messages fetch fails", messageID)
+	}
+}
+
 // TestClient_ArchiveThread tests archiving a thread.
 func TestClient_ArchiveThread(t *testing.T) {
 	mockSession := NewMockSession()
@@ -1325,6 +1373,141 @@ func TestClient_LookupUserByUsername_Success(t *testing.T) {
 	}
 }
 
+// TestClient_LookupUserByUsername_GlobalName tests lookup by global name.
+func TestClient_LookupUserByUsername_GlobalName(t *testing.T) {
+	mockSession := NewMockSession()
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	mockSession.AddMember("test-guild", &discordgo.Member{
+		User: &discordgo.User{
+			ID:         "user-789",
+			Username:   "someuser",
+			GlobalName: "Display Name",
+		},
+	})
+
+	ctx := context.Background()
+	userID := client.LookupUserByUsername(ctx, "Display Name")
+
+	if userID != "user-789" {
+		t.Errorf("LookupUserByUsername() by global name userID = %q, want \"user-789\"", userID)
+	}
+}
+
+// TestClient_LookupUserByUsername_Nick tests lookup by nickname.
+func TestClient_LookupUserByUsername_Nick(t *testing.T) {
+	mockSession := NewMockSession()
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	mockSession.AddMember("test-guild", &discordgo.Member{
+		Nick: "CoolNick",
+		User: &discordgo.User{
+			ID:       "user-999",
+			Username: "plainuser",
+		},
+	})
+
+	ctx := context.Background()
+	userID := client.LookupUserByUsername(ctx, "CoolNick")
+
+	if userID != "user-999" {
+		t.Errorf("LookupUserByUsername() by nickname userID = %q, want \"user-999\"", userID)
+	}
+}
+
+// TestClient_LookupUserByUsername_CaseInsensitive tests case-insensitive matching.
+func TestClient_LookupUserByUsername_CaseInsensitive(t *testing.T) {
+	mockSession := NewMockSession()
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	mockSession.AddMember("test-guild", &discordgo.Member{
+		User: &discordgo.User{
+			ID:       "user-case",
+			Username: "CamelCase",
+		},
+	})
+
+	ctx := context.Background()
+	userID := client.LookupUserByUsername(ctx, "camelcase")
+
+	if userID != "user-case" {
+		t.Errorf("LookupUserByUsername() case-insensitive userID = %q, want \"user-case\"", userID)
+	}
+}
+
+// TestClient_LookupUserByUsername_PrefixMatch tests unambiguous prefix matching.
+func TestClient_LookupUserByUsername_PrefixMatch(t *testing.T) {
+	mockSession := NewMockSession()
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	mockSession.AddMember("test-guild", &discordgo.Member{
+		User: &discordgo.User{
+			ID:       "user-prefix",
+			Username: "PrefixedUser",
+		},
+	})
+
+	ctx := context.Background()
+	userID := client.LookupUserByUsername(ctx, "prefix")
+
+	if userID != "user-prefix" {
+		t.Errorf("LookupUserByUsername() prefix match userID = %q, want \"user-prefix\"", userID)
+	}
+}
+
+// TestClient_LookupUserByUsername_AmbiguousPrefix tests ambiguous prefix matching.
+func TestClient_LookupUserByUsername_AmbiguousPrefix(t *testing.T) {
+	mockSession := NewMockSession()
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	mockSession.AddMember("test-guild", &discordgo.Member{
+		User: &discordgo.User{
+			ID:       "user-1",
+			Username: "TestUser1",
+		},
+	})
+	mockSession.AddMember("test-guild", &discordgo.Member{
+		User: &discordgo.User{
+			ID:       "user-2",
+			Username: "TestUser2",
+		},
+	})
+
+	ctx := context.Background()
+	userID := client.LookupUserByUsername(ctx, "test")
+
+	// Should return empty for ambiguous match
+	if userID != "" {
+		t.Errorf("LookupUserByUsername() ambiguous prefix userID = %q, want empty", userID)
+	}
+}
+
+// TestClient_LookupUserByUsername_NotFound tests when user is not found.
+func TestClient_LookupUserByUsername_NotFound(t *testing.T) {
+	mockSession := NewMockSession()
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	mockSession.AddMember("test-guild", &discordgo.Member{
+		User: &discordgo.User{
+			ID:       "user-other",
+			Username: "someuser",
+		},
+	})
+
+	ctx := context.Background()
+	userID := client.LookupUserByUsername(ctx, "nonexistent")
+
+	if userID != "" {
+		t.Errorf("LookupUserByUsername() not found userID = %q, want empty", userID)
+	}
+}
+
 // TestClient_IsBotInChannel_Success tests IsBotInChannel when bot is in channel.
 func TestClient_IsBotInChannel_Success(t *testing.T) {
 	mockSession := NewMockSession()
@@ -1341,6 +1524,81 @@ func TestClient_IsBotInChannel_Success(t *testing.T) {
 	got := client.IsBotInChannel(ctx, "channel-123")
 	if !got {
 		t.Error("IsBotInChannel() = false, want true when bot has permissions")
+	}
+}
+
+// TestClient_IsBotInChannel_PermissionError tests IsBotInChannel when permission check fails.
+func TestClient_IsBotInChannel_PermissionError(t *testing.T) {
+	mockSession := NewMockSession()
+	mockSession.MockState.User = &discordgo.User{
+		ID:       "bot-id",
+		Username: "testbot",
+	}
+	mockSession.UserChannelPermissionsError = fmt.Errorf("permission check failed")
+
+	client := newTestClientWithMock(mockSession)
+
+	ctx := context.Background()
+	got := client.IsBotInChannel(ctx, "channel-123")
+	if got {
+		t.Error("IsBotInChannel() = true, want false when permission check fails")
+	}
+}
+
+// TestClient_IsUserInGuild_Error tests IsUserInGuild when GuildMember fails.
+func TestClient_IsUserInGuild_Error(t *testing.T) {
+	mockSession := NewMockSession()
+	mockSession.GuildMemberError = fmt.Errorf("member not found")
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	got := client.IsUserInGuild(context.Background(), "user-123")
+	if got {
+		t.Error("IsUserInGuild() = true, want false when GuildMember fails")
+	}
+}
+
+// TestClient_IsUserActive_Error tests IsUserActive when guild state is unavailable.
+func TestClient_IsUserActive_Error(t *testing.T) {
+	mockSession := NewMockSession()
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	// Don't add guild to state, so state lookup will fail
+	ctx := context.Background()
+	got := client.IsUserActive(ctx, "user-123")
+	if got {
+		t.Error("IsUserActive() = true, want false when guild state unavailable")
+	}
+}
+
+// TestClient_GuildInfo_Error tests GuildInfo when guild lookup fails.
+func TestClient_GuildInfo_Error(t *testing.T) {
+	mockSession := NewMockSession()
+	mockSession.GuildError = fmt.Errorf("guild not found")
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	ctx := context.Background()
+	_, err := client.GuildInfo(ctx)
+	if err == nil {
+		t.Error("GuildInfo() error = nil, want error when guild lookup fails")
+	}
+}
+
+// TestClient_ResolveChannelID_Error tests ResolveChannelID when GuildChannels fails.
+func TestClient_ResolveChannelID_Error(t *testing.T) {
+	mockSession := NewMockSession()
+	mockSession.GuildChannelsError = fmt.Errorf("channels fetch failed")
+	client := newTestClientWithMock(mockSession)
+	client.SetGuildID("test-guild")
+
+	ctx := context.Background()
+	got := client.ResolveChannelID(ctx, "test-channel")
+
+	// Should return input unchanged when fetch fails
+	if got != "test-channel" {
+		t.Errorf("ResolveChannelID() = %q, want %q when fetch fails", got, "test-channel")
 	}
 }
 
@@ -1417,5 +1675,29 @@ func TestClient_BotInfo_Success(t *testing.T) {
 	}
 	if botInfo.Username != "testbot" {
 		t.Errorf("BotInfo() botInfo.Username = %q, want \"testbot\"", botInfo.Username)
+	}
+}
+
+// TestSessionAdapter_GetState tests the sessionAdapter.GetState method
+func TestSessionAdapter_GetState(t *testing.T) {
+	state := discordgo.NewState()
+	state.User = &discordgo.User{
+		ID:       "bot-123",
+		Username: "testbot",
+	}
+
+	session := &discordgo.Session{
+		State: state,
+	}
+
+	adapter := &sessionAdapter{Session: session}
+
+	gotState := adapter.GetState()
+	if gotState != state {
+		t.Errorf("GetState() = %v, want %v", gotState, state)
+	}
+
+	if gotState.User.ID != "bot-123" {
+		t.Errorf("GetState().User.ID = %v, want bot-123", gotState.User.ID)
 	}
 }

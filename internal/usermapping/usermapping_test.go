@@ -107,6 +107,56 @@ func TestMapper_DiscordID_ConfigOverridesDiscord(t *testing.T) {
 	}
 }
 
+// TestMapper_DiscordID_ConfigUsername tests config value being a Discord username.
+func TestMapper_DiscordID_ConfigUsername(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockConfigLookup{
+		users: map[string]string{
+			"alice": "AliceDiscord", // Discord username, not numeric ID
+		},
+	}
+
+	discordLookup := &mockDiscordLookup{
+		users: map[string]string{
+			"AliceDiscord": "111111111111111111",
+		},
+	}
+
+	mapper := New("testorg", configLookup, discordLookup, nil, "test-guild")
+
+	got := mapper.DiscordID(ctx, "alice")
+	if got != "111111111111111111" {
+		t.Errorf("DiscordID(alice) with config username = %q, want 111111111111111111", got)
+	}
+}
+
+// TestMapper_DiscordID_ConfigUsername_NotFound tests when config username isn't found.
+func TestMapper_DiscordID_ConfigUsername_NotFound(t *testing.T) {
+	ctx := context.Background()
+
+	configLookup := &mockConfigLookup{
+		users: map[string]string{
+			"alice": "NonExistentUser", // Discord username not found
+		},
+	}
+
+	discordLookup := &mockDiscordLookup{
+		users: map[string]string{
+			"OtherUser": "222222222222222222",
+		},
+	}
+
+	mapper := New("testorg", configLookup, discordLookup, nil, "test-guild")
+
+	// Should fall back to tier 3 (Discord username match)
+	// Since "alice" is not in Discord either, should return empty
+	got := mapper.DiscordID(ctx, "alice")
+	if got != "" {
+		t.Errorf("DiscordID(alice) with unknown config username = %q, want empty", got)
+	}
+}
+
 func TestMapper_DiscordID_Caching(t *testing.T) {
 	ctx := context.Background()
 
@@ -625,5 +675,32 @@ func TestReverseMapper_CacheTTL(t *testing.T) {
 	username2 := mapper.GitHubUsername(ctx, "111111111111111111", configLookup, []string{"org1"})
 	if username2 != "bob" {
 		t.Errorf("After TTL expiry: GitHubUsername = %q, want bob", username2)
+	}
+}
+
+// TestIsAllDigits tests the isAllDigits helper function.
+func TestIsAllDigits(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", false},
+		{"123", true},
+		{"12345678901234567890", true},
+		{"123abc", false},
+		{"abc123", false},
+		{"12.34", false},
+		{"12-34", false},
+		{"0", true},
+		{"00000", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := isAllDigits(tt.input)
+			if got != tt.want {
+				t.Errorf("isAllDigits(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }

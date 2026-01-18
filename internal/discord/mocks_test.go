@@ -533,3 +533,86 @@ func (m *MockSession) GuildThreadsActive(guildID string, options ...discordgo.Re
 		Threads: m.ActiveThreads,
 	}, nil
 }
+
+// ApplicationCommandCreate mocks creating a slash command
+func (m *MockSession) ApplicationCommandCreate(appID, guildID string, cmd *discordgo.ApplicationCommand, options ...discordgo.RequestOption) (*discordgo.ApplicationCommand, error) {
+	if m.ApplicationCommandsError != nil {
+		return nil, m.ApplicationCommandsError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Assign an ID to the command
+	cmd.ID = fmt.Sprintf("cmd-%d", len(m.Commands)+1)
+	cmd.ApplicationID = appID
+	cmd.GuildID = guildID
+
+	m.Commands = append(m.Commands, cmd)
+	return cmd, nil
+}
+
+// ApplicationCommands mocks listing slash commands
+func (m *MockSession) ApplicationCommands(appID, guildID string, options ...discordgo.RequestOption) ([]*discordgo.ApplicationCommand, error) {
+	if m.ApplicationCommandsError != nil {
+		return nil, m.ApplicationCommandsError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.Commands, nil
+}
+
+// ApplicationCommandDelete mocks deleting a slash command
+func (m *MockSession) ApplicationCommandDelete(appID, guildID, cmdID string, options ...discordgo.RequestOption) error {
+	if m.ApplicationCommandsError != nil {
+		return m.ApplicationCommandsError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Remove command from the list
+	for i, cmd := range m.Commands {
+		if cmd.ID == cmdID {
+			m.Commands = append(m.Commands[:i], m.Commands[i+1:]...)
+			break
+		}
+	}
+
+	return nil
+}
+
+// InteractionResponseEdit mocks editing an interaction response
+func (m *MockSession) InteractionResponseEdit(interaction *discordgo.Interaction, data *discordgo.WebhookEdit, options ...discordgo.RequestOption) (*discordgo.Message, error) {
+	if m.InteractionResponseError != nil {
+		return nil, m.InteractionResponseError
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	content := ""
+	if data.Content != nil {
+		content = *data.Content
+	}
+
+	var embeds []*discordgo.MessageEmbed
+	if data.Embeds != nil {
+		embeds = *data.Embeds
+	}
+
+	return &discordgo.Message{
+		ID:      interaction.ID,
+		Content: content,
+		Embeds:  embeds,
+	}, nil
+}
+
+// AddHandler mocks adding a handler (no-op for testing)
+func (m *MockSession) AddHandler(handler interface{}) func() {
+	// In tests, we don't need to actually register handlers
+	// Return a no-op cleanup function
+	return func() {}
+}

@@ -655,3 +655,22 @@ func TestFidoStore_UserMapping(t *testing.T) {
 	_ = guildID
 	_ = githubUser2
 }
+
+// TestFidoStore_ListUserMappings tests that ListUserMappings returns empty slice
+func TestFidoStore_ListUserMappings(t *testing.T) {
+	ctx := context.Background()
+	store := newTestFidoStore(t)
+	defer store.Close() //nolint:errcheck // test cleanup
+
+	// ListUserMappings currently returns empty slice and logs a warning
+	// This is a known limitation of FidoStore
+	mappings := store.ListUserMappings(ctx, "guild-123")
+
+	if mappings == nil {
+		t.Error("ListUserMappings() should not return nil")
+	}
+
+	if len(mappings) != 0 {
+		t.Errorf("ListUserMappings() = %v, want empty slice", mappings)
+	}
+}
